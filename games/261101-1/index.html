@@ -171,9 +171,9 @@ function layout(){
   const portrait=H>W*1.1;L.portrait=portrait;
   if(portrait){
     L.lot={x0:ins.l+6,x1:W-ins.r-6,y0:ins.t+22,y1:Math.round(H*0.43)};
-    L.oven={x:Math.round(W*0.80-ins.r*0.5),y:Math.round(H*0.555)};
-    L.home={x:Math.round(W*0.40),y:Math.round(H*0.75-ins.b*0.5)};
-    L.rhome={x:Math.round(W*0.16)+ins.l,y:Math.round(H*0.555)};
+    L.oven={x:Math.round(W*0.80-ins.r*0.5),y:Math.round((H-ins.b)*0.78)};
+    L.home={x:Math.round(W*0.50)+R0+1,y:Math.round(H*0.50)};
+    L.rhome={x:Math.round(W*0.16)+ins.l,y:Math.round((H-ins.b)*0.78)};
   }else{
     L.lot={x0:Math.round(W*0.58),x1:W-ins.r-6,y0:ins.t+16,y1:H-ins.b-6};
     L.oven={x:Math.round(W*0.47),y:Math.round(H*0.50)};
