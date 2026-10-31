@@ -562,25 +562,41 @@ function gallerySlots(){
 const lastPtr = new Map();
 function onDown(e){
   e.preventDefault();
+  if (lastPtr.has(e.pointerId)) return;
   ensureAudio();
   const x = e.clientX, y = e.clientY, t = now();
   G.lastInput = t;
   if (G.demo){ G.demo = null; }
   const dn = drumHitTest(x, y);
-  if (dn){ hitDrum(dn, t); return; }
+  if (dn){
+    lastPtr.set(e.pointerId, dn);
+    try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+    hitDrum(dn, t); return;
+  }
   if (G.phase === 'gallery'){
     for (const sl of gallerySlots()){
       if (x >= sl.x - 8 && x <= sl.x + sl.w + 8 && y >= sl.y - 8 && y <= sl.y + sl.h + 8){ pickSheet(sl.idx); return; }
     }
-    return;
   }
+  // 余白では演奏せず、今触れる対象を既存のお手本で知らせる。
+  const target = highlightTarget();
+  if (target){ G.demo = {key:'nudge', t0:t, target}; G.child.pointT = t; }
   // 関係ない場所：小さく揺れるだけ
   const R = sheetRect(), M = sceneMap(R), c = childPos(M);
   if (Math.abs(x - c.x) < M.U * 0.12 && y > c.y - M.U * 0.25 && y < c.y + M.U * 0.02){ G.child.wigT = t; return; }
   if (x > R.x && x < R.x + R.w && y > R.y && y < R.y + R.h) G.paperWob = t;
 }
 cv.addEventListener('pointerdown', onDown, {passive:false});
-for (const ev of ['pointerup', 'pointercancel', 'pointerleave', 'pointerout', 'lostpointercapture']) cv.addEventListener(ev, e => { lastPtr.delete(e.pointerId); }, {passive:true});
+function releasePointer(e){
+  const dn = lastPtr.get(e.pointerId);
+  lastPtr.delete(e.pointerId);
+  if (dn && !Array.from(lastPtr.values()).includes(dn)) G.drums[dn].pressT = now();
+}
+cv.addEventListener('pointermove', e => {
+  const dn = lastPtr.get(e.pointerId);
+  if (dn && drumHitTest(e.clientX, e.clientY) !== dn) releasePointer(e);
+}, {passive:true});
+for (const ev of ['pointerup', 'pointercancel', 'pointerleave', 'pointerout', 'lostpointercapture']) cv.addEventListener(ev, releasePointer, {passive:true});
 document.addEventListener('touchstart', e => { if (e.cancelable) e.preventDefault(); }, {passive:false});
 document.addEventListener('touchmove', e => { if (e.cancelable) e.preventDefault(); }, {passive:false});
 document.addEventListener('touchend', () => { ensureAudio(); }, {passive:true});
@@ -1015,6 +1031,7 @@ function drawDrum(g, name, hl){
   const d = LY[name], D = G.drums[name], t = G.t, R = d.R;
   let cy = d.y, sq = 0;
   const pt = t - D.pressT; if (pt >= 0 && pt < 0.7) sq = Math.exp(-pt * 8) * Math.cos(pt * 28);
+  if (Array.from(lastPtr.values()).includes(name)) sq = Math.max(0.6, sq);
   let bob = 0; if (hl){ const ph = (t * 1.6) % 1; bob = -Math.max(0, Math.sin(ph * Math.PI * 2)) * R * 0.07 * (ph < 0.5 ? 1 : 0); }
   cy += bob;
   const ry = R * 0.36;
@@ -1236,7 +1253,8 @@ function frame(ts){
   update(dt); draw();
 }
 function start(){ if (running) return; running = true; lastReal = performance.now() / 1000; raf = requestAnimationFrame(frame); }
-function stop(){ running = false; cancelAnimationFrame(raf); }
+function stop(){ running = false; cancelAnimationFrame(raf); lastPtr.clear(); }
+window.addEventListener('blur', () => lastPtr.clear());
 document.addEventListener('visibilitychange', () => {
   if (document.hidden){ stop(); try { if (AC && AC.state === 'running') AC.suspend(); } catch (e) {} }
   else { try { if (AC && AC.state === 'suspended') AC.resume(); } catch (e) {} start(); }
