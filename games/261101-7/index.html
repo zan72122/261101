@@ -1,0 +1,1268 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#e6dcc6">
+<title>どん、ぽん！墨たいこの山びらき</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#e6dcc6;
+  overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;
+  -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;-webkit-text-size-adjust:100%}
+canvas{position:fixed;left:0;top:0;display:block;touch-action:none;-webkit-touch-callout:none}
+#safe{position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;pointer-events:none;
+  padding-top:env(safe-area-inset-top);padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="safe"></div>
+<script>
+'use strict';
+(function(){
+// =====================================================================
+//  どん、ぽん！墨たいこの山びらき  — 文字なし・一本指・墨の太鼓あそび
+// =====================================================================
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const N = 120;                 // 地形の列数
+const MAX_PARTS = 120;         // 同時粒子の上限
+const MAX_DOTS = 200;          // 一枚あたりの墨点の上限
+const MAX_PINES = 48;
+let W = 0, H = 0, DPR = 1;
+const SAFE = {t:0, r:0, b:0, l:0};
+
+// ---------------- 乱数・補助 ----------------
+function mulberry(a){ return function(){ a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+let seedState = (Math.random() * 1e9) >>> 0;
+function newSeed(){ seedState = (Math.imul(seedState, 1103515245) + 12345) >>> 0; return seedState; }
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const easeInOut = t => { t = clamp(t, 0, 1); return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+
+// 墨の五階調
+const TONE = [[22,19,17],[54,49,45],[94,88,82],[144,137,127],[190,182,168]];
+function ink(t, a){ const c = TONE[t]; return 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + a + ')'; }
+const PAPER = 'rgba(243,236,220,';
+const SHU = 'rgba(196,58,36,';
+
+// ---------------- 和紙テクスチャ ----------------
+function makePaperCanvas(r0, g0, b0, seed){
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = 'rgb(' + r0 + ',' + g0 + ',' + b0 + ')'; g.fillRect(0, 0, 256, 256);
+  const r = mulberry(seed);
+  for (let i = 0; i < 700; i++){ g.fillStyle = 'rgba(120,98,66,' + (r() * 0.045) + ')'; g.fillRect(r() * 256, r() * 256, 1 + r() * 2, 1 + r() * 2); }
+  g.lineCap = 'round';
+  for (let i = 0; i < 140; i++){
+    const x = r() * 256, y = r() * 256, a = r() * Math.PI * 2, l = 8 + r() * 34;
+    g.strokeStyle = (r() < 0.6) ? 'rgba(150,126,92,' + (0.04 + r() * 0.07) + ')' : 'rgba(255,252,244,' + (0.25 + r() * 0.3) + ')';
+    g.lineWidth = 0.4 + r() * 0.8;
+    g.beginPath(); g.moveTo(x, y);
+    g.quadraticCurveTo(x + Math.cos(a) * l * 0.5 + (r() - 0.5) * 10, y + Math.sin(a) * l * 0.5 + (r() - 0.5) * 10, x + Math.cos(a) * l, y + Math.sin(a) * l);
+    g.stroke();
+  }
+  return c;
+}
+const paperBgCv = makePaperCanvas(228, 218, 196, 11);
+const paperSheetCv = makePaperCanvas(243, 236, 220, 23);
+const patCache = new Map();
+function pat(g, which){
+  let m = patCache.get(g); if (!m){ m = {}; patCache.set(g, m); }
+  if (!m[which]) m[which] = g.createPattern(which === 'bg' ? paperBgCv : paperSheetCv, 'repeat');
+  return m[which];
+}
+
+// ---------------- 筆 ----------------
+// 太さの変わる筆線（多角形で塗る）
+function strokePoly(g, pts, wf){
+  const n = pts.length; if (n < 2) return;
+  const Lx = new Array(n), Ly = new Array(n), Rx = new Array(n), Ry = new Array(n);
+  for (let i = 0; i < n; i++){
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+    let dx = b[0] - a[0], dy = b[1] - a[1]; const l = Math.hypot(dx, dy) || 1;
+    const nx = -dy / l, ny = dx / l, w = wf(i / (n - 1)) * 0.5;
+    Lx[i] = pts[i][0] + nx * w; Ly[i] = pts[i][1] + ny * w;
+    Rx[i] = pts[i][0] - nx * w; Ry[i] = pts[i][1] - ny * w;
+  }
+  g.beginPath(); g.moveTo(Lx[0], Ly[0]);
+  for (let i = 1; i < n; i++) g.lineTo(Lx[i], Ly[i]);
+  for (let i = n - 1; i >= 0; i--) g.lineTo(Rx[i], Ry[i]);
+  g.closePath(); g.fill();
+}
+// かすれ：紙色の細い筋を筆線の中に走らせる
+function kasure(g, pts, wf, rnd, k, alpha){
+  const n = pts.length; if (n < 2) return;
+  g.save(); g.lineCap = 'butt';
+  for (let j = 0; j < k; j++){
+    const off = (rnd() - 0.5) * 0.8;
+    g.strokeStyle = PAPER + (alpha * (0.5 + rnd() * 0.5)) + ')';
+    g.lineWidth = 0.5 + rnd() * 1.3;
+    g.setLineDash([2 + rnd() * 16, 1 + rnd() * 6, 1 + rnd() * 10, 2 + rnd() * 5]);
+    g.lineDashOffset = rnd() * 30;
+    g.beginPath();
+    for (let i = 0; i < n; i++){
+      const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+      let dx = b[0] - a[0], dy = b[1] - a[1]; const l = Math.hypot(dx, dy) || 1;
+      const w = wf(i / (n - 1)) * off;
+      const x = pts[i][0] - dy / l * w, y = pts[i][1] + dx / l * w;
+      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  g.setLineDash([]); g.restore();
+}
+function brush(g, pts, wmax, tone, alpha, seed, dry){
+  const r = mulberry(seed || 1);
+  const ph = r() * 6, amp = 0.25;
+  const wf = t => wmax * (0.25 + 0.75 * Math.pow(Math.sin(Math.PI * clamp(t * 0.92 + 0.04, 0, 1)), 0.55)) * (1 + amp * Math.sin(t * 7 + ph) * 0.6);
+  g.fillStyle = ink(tone, alpha); strokePoly(g, pts, wf);
+  if (dry) kasure(g, pts, wf, r, dry, 0.75);
+}
+// 墨点（濃＝かすれ、薄＝にじみ）
+function blot(g, x, y, r, tone, alpha, seed, dense, grow){
+  const rnd = mulberry(seed);
+  if (!dense){
+    const R2 = r * (1.25 + 0.85 * grow);
+    const gr = g.createRadialGradient(x, y, r * 0.3, x, y, R2);
+    gr.addColorStop(0, ink(tone, alpha * 0.85)); gr.addColorStop(0.55, ink(tone, alpha * 0.4)); gr.addColorStop(1, ink(tone, 0));
+    g.fillStyle = gr; g.beginPath();
+    for (let k = 0; k < 14; k++){ const a = k / 14 * Math.PI * 2, rr = R2 * (0.8 + rnd() * 0.35); const px = x + Math.cos(a) * rr * 1.25, py = y + Math.sin(a) * rr * 0.8; if (k) g.lineTo(px, py); else g.moveTo(px, py); }
+    g.closePath(); g.fill();
+    // 紙の繊維に沿ったにじみ筋
+    g.strokeStyle = ink(tone, alpha * 0.45); g.lineWidth = Math.max(0.6, r * 0.06);
+    for (let k = 0; k < 7; k++){
+      const a = (rnd() < 0.5 ? 0 : Math.PI) + (rnd() - 0.5) * 0.9, s = R2 * (0.6 + rnd() * 0.3), l = r * (0.3 + grow * (0.6 + rnd() * 0.7));
+      g.beginPath(); g.moveTo(x + Math.cos(a) * s, y + Math.sin(a) * s * 0.7); g.lineTo(x + Math.cos(a) * (s + l), y + Math.sin(a) * (s + l) * 0.7 + (rnd() - 0.5) * r * 0.3); g.stroke();
+    }
+    g.fillStyle = ink(tone, alpha * 0.7); g.beginPath(); g.ellipse(x, y, r * 0.75, r * 0.6, 0, 0, Math.PI * 2); g.fill();
+    return;
+  }
+  g.fillStyle = ink(tone, alpha); g.beginPath();
+  for (let k = 0; k < 16; k++){ const a = k / 16 * Math.PI * 2, rr = r * (0.82 + rnd() * 0.32); const px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr * 0.9; if (k) g.lineTo(px, py); else g.moveTo(px, py); }
+  g.closePath(); g.fill();
+  // かすれの白抜き
+  g.fillStyle = PAPER + '0.55)';
+  for (let k = 0; k < 4; k++){ const a = rnd() * 6.28, d = r * (0.35 + rnd() * 0.5); g.beginPath(); g.ellipse(x + Math.cos(a) * d, y + Math.sin(a) * d, r * (0.08 + rnd() * 0.12), r * 0.04 + 0.4, a, 0, Math.PI * 2); g.fill(); }
+  // 跳ね
+  g.fillStyle = ink(tone, alpha * 0.9);
+  for (let k = 0; k < 3; k++){ const a = rnd() * 6.28, d = r * (1.15 + rnd() * 0.6); g.beginPath(); g.arc(x + Math.cos(a) * d, y + Math.sin(a) * d * 0.8, r * (0.05 + rnd() * 0.09), 0, Math.PI * 2); g.fill(); }
+}
+
+// ---------------- 地形（一枚の絵） ----------------
+function newSheet(){
+  const s = { h:new Float32Array(N), w:new Float32Array(N), rock:new Float32Array(N), conn:new Uint8Array(N), shore:new Uint8Array(N),
+    dots:[], pines:[], paths:[], sealed:false, far:0, seed:newSeed() };
+  // 紙端の描きかけの山裾
+  for (let i = 0; i < 16; i++){ const u = i / 16; s.h[i] = 0.17 * Math.pow(1 - u, 1.5); s.rock[i] = 0.3 * (1 - u); s.conn[i] = i < 10 ? 1 : 0; }
+  return s;
+}
+function cloneSheet(S){
+  return { h:new Float32Array(S.h), w:new Float32Array(S.w), rock:new Float32Array(S.rock), conn:new Uint8Array(S.conn), shore:new Uint8Array(S.shore),
+    dots:S.dots.map(d => Object.assign({}, d, {t0:-99})), pines:S.pines.map(p => Object.assign({}, p, {t0:-99})),
+    paths:S.paths.map(p => Object.assign({}, p, {prog:1})), sealed:S.sealed, far:S.far, seed:S.seed };
+}
+function col(x){ return clamp(Math.floor(x * N), 0, N - 1); }
+function hAt(arr, x){ const f = x * N - 0.5; const i = Math.floor(f), t = f - i; const a = arr[clamp(i, 0, N - 1)], b = arr[clamp(i + 1, 0, N - 1)]; return a + (b - a) * t; }
+function isLakeCol(S, i){ return S.w[i] >= 1 && S.h[i] < 0.05; }
+function lakeSpans(S){
+  const sp = []; let a = -1;
+  for (let i = 0; i <= N; i++){
+    const l = i < N && isLakeCol(S, i);
+    if (l && a < 0) a = i;
+    if (!l && a >= 0){ if (i - a >= 3) sp.push([a, i - 1]); a = -1; }
+  }
+  return sp;
+}
+function nearestLakeEdge(S, x){
+  const c = col(x); let best = -1, bd = 1e9;
+  for (const [a, b] of lakeSpans(S)){
+    for (const e of (b - a >= 2 ? [a, b] : [a])){ const d = Math.abs(e - c); if (d < bd){ bd = d; best = e; } }
+    if (c >= a && c <= b){ const e = (c - a < b - c) ? a : b; return e; }
+  }
+  return best;
+}
+function lakeNear(S, x, d){ const c = col(x); for (let i = c - d; i <= c + d; i++){ if (i >= 0 && i < N && isLakeCol(S, i)) return true; } return false; }
+function peakShape(d){ const a = Math.abs(d); return a >= 2.6 ? 0 : Math.pow(1 - a / 2.6, 1.8); }
+function addBump(S, x, amp, sig, cap, keepLake){
+  for (let i = 0; i < N; i++){
+    const xi = (i + 0.5) / N; let g = peakShape((xi - x) / sig);
+    if (g <= 0) continue;
+    // 山の裾野は湖を埋めない（湖を変えるのは岸への濃い一打）
+    if (keepLake && isLakeCol(S, i)){ if (g < 0.5) continue; g *= 0.3; }
+    const nv = S.h[i] + amp * g;
+    if (S.h[i] < cap) S.h[i] = Math.min(cap, nv);
+  }
+}
+function addRock(S, x, amp, sig){ for (let i = 0; i < N; i++){ const g = peakShape(((i + 0.5) / N - x) / sig); if (g > 0) S.rock[i] = Math.min(1.5, S.rock[i] + amp * g); } }
+function addMist(S, x, amp, sig){ for (let i = 0; i < N; i++){ const d = ((i + 0.5) / N - x) / sig; const g = Math.exp(-d * d / 2); if (g > 0.02) S.w[i] = Math.min(1.8, S.w[i] + amp * g); } }
+function smoothArr(a, r){ const o = new Float32Array(N); for (let i = 0; i < N; i++){ let s = 0, c = 0; for (let k = -r; k <= r; k++){ const j = clamp(i + k, 0, N - 1); s += a[j]; c++; } o[i] = s / c; } return o; }
+
+function sceneMap(R){
+  const base = R.y + R.h * 0.62, U = R.h;
+  return { R, U, base, X: xn => R.x + R.w * (0.03 + 0.94 * xn), Y: h => base - h * U, xn: px => ((px - R.x) / R.w - 0.03) / 0.94 };
+}
+function dotY(M, S, hA, d){ const hs = hAt(hA, d.x); if (d.ha < 0.012) return M.Y(hs + d.hc); return M.Y(hs * clamp(d.hc / d.ha, 0, 1.05)); }
+
+function renderSheet(g, S, hA, R, o){
+  const M = sceneMap(R), U = M.U, X = M.X, Y = M.Y, base = M.base, t = o.t || 0, mini = !!o.mini;
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  // 遠山（朱印のあとで一枚の絵としてつながる）
+  if (S.far > 0.01){
+    const sm = smoothArr(hA, 8), off = U * 0.05;
+    const gr = g.createLinearGradient(0, Y(0.45), 0, base);
+    gr.addColorStop(0, ink(3, 0.34 * S.far)); gr.addColorStop(1, ink(4, 0));
+    g.fillStyle = gr; g.beginPath(); g.moveTo(X(0), base - off);
+    for (let i = 0; i < N; i++){ const hh = 0.1 + sm[i] * 0.5 + 0.05 * Math.sin(i * 0.23 + (S.seed % 13)) + 0.03 * Math.sin(i * 0.61); g.lineTo(X((i + 0.5) / N), Y(hh) - off); }
+    g.lineTo(X(1), base - off); g.closePath(); g.fill();
+  }
+  // 山
+  let i = 0;
+  while (i < N){
+    if (hA[i] <= 0.006){ i++; continue; }
+    const a = i; while (i < N && hA[i] > 0.006) i++; const b = i - 1;
+    let peak = 0, rk = 0; for (let j = a; j <= b; j++){ peak = Math.max(peak, hA[j]); rk += S.rock[j]; } rk /= (b - a + 1);
+    const pts = [];
+    pts.push([a === 0 ? X(0) : X(a / N), a === 0 ? Y(hA[0]) : base]);
+    for (let j = a; j <= b; j++) pts.push([X((j + 0.5) / N), Y(hA[j])]);
+    pts.push([b === N - 1 ? X(1) : X((b + 1) / N), b === N - 1 ? Y(hA[N - 1]) : base]);
+    const gr = g.createLinearGradient(0, Y(peak), 0, base);
+    gr.addColorStop(0, ink(1, Math.min(0.75, 0.3 + 0.32 * rk))); gr.addColorStop(0.5, ink(2, 0.2)); gr.addColorStop(1, ink(3, 0.02));
+    g.fillStyle = gr; g.beginPath(); g.moveTo(pts[0][0], base);
+    for (const p of pts) g.lineTo(p[0], p[1]);
+    g.lineTo(pts[pts.length - 1][0], base); g.closePath(); g.fill();
+    // 稜線近くのにじみ
+    g.strokeStyle = ink(2, 0.14); g.lineWidth = U * 0.03; g.beginPath();
+    for (let k = 1; k < pts.length - 1; k++){ if (k === 1) g.moveTo(pts[k][0], pts[k][1] + U * 0.012); else g.lineTo(pts[k][0], pts[k][1] + U * 0.012); }
+    g.stroke();
+    // 皴（岩肌）
+    for (let j = a; j <= b; j += 2){
+      if (S.rock[j] < 0.15 || hA[j] < 0.05) continue;
+      const r = mulberry(S.seed + j * 31); const n = 1 + Math.floor(S.rock[j] * 1.6);
+      g.fillStyle = ink(1, 0.5);
+      for (let k = 0; k < n; k++){
+        const hy = hA[j] * (0.92 - r() * 0.6), x0 = X((j + 0.5) / N) + (r() - 0.5) * U * 0.025, y0 = Y(hy);
+        const dir = r() < 0.5 ? -1 : 1, x1 = x0 + dir * U * 0.03 * (0.5 + r()), y1 = y0 + U * 0.045 * (0.5 + r());
+        strokePoly(g, [[x0, y0], [(x0 + x1) / 2 + dir * U * 0.004, (y0 + y1) / 2], [x1, y1]], tt => U * 0.007 * (1 - tt * 0.8));
+      }
+    }
+    // 稜線：結ばれた所は濃い筆、まだの所は淡い気配
+    let k = a;
+    while (k <= b){
+      const cls = j => hA[j] < 0.03 ? 2 : S.conn[j];
+      const c = cls(k);
+      const s0 = k; while (k <= b && cls(k) === c) k++; const s1 = k - 1;
+      if (c === 2) continue;
+      const rp = [];
+      for (let j = s0; j <= s1; j++) rp.push([X((j + 0.5) / N), Y(hA[j])]);
+      if (s0 === a && a > 0) rp.unshift([X(a / N), base - U * 0.002]);
+      if (s1 === b && b < N - 1) rp.push([X((b + 1) / N), base - U * 0.002]);
+      if (s0 > a && cls(s0 - 1) === 2) rp.unshift([X(s0 / N), Y(hA[s0 - 1])]);
+      if (s1 < b && cls(s1 + 1) === 2) rp.push([X((s1 + 1) / N), Y(hA[s1 + 1])]);
+      if (rp.length < 2) continue;
+      if (c){
+        brush(g, rp, U * (0.012 + 0.006 * Math.min(1, rk)), 0, 0.9, S.seed + s0 * 7, mini ? 0 : 4);
+      } else {
+        g.strokeStyle = ink(3, 0.45); g.lineWidth = 1; g.setLineDash([U * 0.01, U * 0.008]);
+        g.beginPath(); rp.forEach((p, q) => q ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1])); g.stroke(); g.setLineDash([]);
+      }
+    }
+  }
+  // 墨点（苔点）
+  for (const d of S.dots){
+    const age = mini ? 9 : t - d.t0;
+    const sc = age < 0.15 ? 0.45 + 0.55 * easeOut(age / 0.15) : 1;
+    const grow = clamp(age / 0.9, 0, 1);
+    // 稜線が結ばれた所の点は、小さな苔点になって山肌になじむ
+    const joined = d.big && d.dense && S.conn[col(d.x)] && hA[col(d.x)] > 0.03;
+    const r = U * d.r * sc * (joined ? 0.6 : 1);
+    blot(g, X(d.x), dotY(M, S, hA, d) - (d.dense && d.big ? 0 : r * 0.2), r, d.dense ? (joined ? 1 : 0) : 3, d.dense ? (joined ? 0.8 : 0.92) : 0.55, d.seed, d.dense, grow);
+  }
+  // 坂道
+  for (const p of S.paths){
+    const x1 = lerp(p.x0, p.x1, p.prog); if (x1 - p.x0 < 0.004) continue;
+    g.strokeStyle = ink(1, 0.75); g.lineWidth = Math.max(1, U * 0.0045); g.setLineDash([U * 0.012, U * 0.007]);
+    g.beginPath();
+    for (let x = p.x0, q = 0; x <= x1 + 1e-6; x += 0.004, q++){
+      const hh = hAt(hA, x), yy = Y(hh * 0.5 + 0.008) + Math.sin(x * N * 0.8) * U * Math.min(0.02, hh * 0.08);
+      if (q) g.lineTo(X(x), yy); else g.moveTo(X(x), yy);
+    }
+    g.stroke(); g.setLineDash([]);
+  }
+  // 松
+  for (const p of S.pines) drawPine(g, X(p.x), Y(hAt(hA, p.x)) + U * 0.004, U * 0.11 * p.s, p, t, mini);
+  // 霞
+  i = 0;
+  while (i < N){
+    const m = S.w[i] > 0.12 && !isLakeCol(S, i);
+    if (!m){ i++; continue; }
+    const a = i; let sw = 0; while (i < N && S.w[i] > 0.12 && !isLakeCol(S, i)){ sw += Math.min(1, S.w[i]); i++; }
+    const b = i - 1, aw = sw / (b - a + 1);
+    const x0 = X(a / N) - U * 0.02, x1 = X((b + 1) / N) + U * 0.02, yc = base - U * (0.035 + 0.12 * (1 - aw)), hh = U * (0.018 + 0.026 * aw), dx = (x1 - x0) * 0.25;
+    g.fillStyle = ink(3, 0.07 + 0.15 * aw); g.beginPath(); g.moveTo(x0, yc);
+    g.bezierCurveTo(x0 + dx, yc - hh, x1 - dx, yc - hh, x1, yc); g.bezierCurveTo(x1 - dx, yc + hh, x0 + dx, yc + hh, x0, yc); g.fill();
+    const r = mulberry(S.seed + a * 13);
+    g.strokeStyle = ink(3, 0.22 + 0.2 * aw); g.lineWidth = Math.max(0.8, U * 0.003);
+    for (let q = 0; q < 2; q++){ const yy = yc + (r() - 0.5) * hh; const xa = x0 + dx * r(), xb = x1 - dx * r(); g.beginPath(); g.moveTo(xa, yy); g.lineTo(xb, yy + (r() - 0.5) * U * 0.004); g.stroke(); }
+  }
+  // 湖
+  const spans = lakeSpans(S);
+  for (const [a, b] of spans){
+    const x0 = X(a / N), x1 = X((b + 1) / N), yt = base - U * 0.006, yb = base + U * 0.055, dx = Math.min((x1 - x0) * 0.2, U * 0.05);
+    g.fillStyle = ink(3, 0.2); g.beginPath(); g.moveTo(x0, yt);
+    g.lineTo(x1, yt); g.quadraticCurveTo(x1 + dx * 0.3, (yt + yb) / 2, x1 - dx, yb); g.lineTo(x0 + dx, yb); g.quadraticCurveTo(x0 - dx * 0.3, (yt + yb) / 2, x0, yt); g.fill();
+    g.fillStyle = ink(3, 0.14); g.fillRect(x0 + dx * 0.5, yt, x1 - x0 - dx, U * 0.016);
+    const r = mulberry(S.seed + a * 97 + b);
+    g.strokeStyle = ink(2, 0.42); g.lineWidth = Math.max(0.8, U * 0.0035);
+    const nr = Math.max(2, Math.floor((x1 - x0) / (U * 0.07)));
+    for (let q = 0; q < nr; q++){ const xx = lerp(x0 + dx, x1 - dx, (q + r() * 0.8) / nr), yy = lerp(yt + U * 0.01, yb - U * 0.008, r()), l = U * (0.02 + r() * 0.03); g.beginPath(); g.moveTo(xx, yy); g.quadraticCurveTo(xx + l * 0.5, yy - U * 0.004, xx + l, yy); g.stroke(); }
+    // 岸
+    for (const [sx, dir] of [[x0, -1], [x1, 1]]){
+      const ci = dir < 0 ? a - 1 : b + 1;
+      if (ci < 0 || ci >= N) continue;
+      if (S.h[ci] > 0.02 || S.shore[ci]){
+        const rr = mulberry(S.seed + ci * 5);
+        g.fillStyle = ink(0, 0.8);
+        for (let q = 0; q < 3; q++){ const px = sx + dir * U * (0.003 + rr() * 0.012), py = base + U * (0.004 + q * 0.014); strokePoly(g, [[px, py], [px - dir * U * 0.02 * (0.6 + rr()), py + U * 0.008]], tt => U * 0.008 * (1 - tt * 0.7)); }
+      }
+    }
+  }
+  // 岸の岩（湖に濃い一打）
+  for (let j = 0; j < N; j++){
+    if (!S.shore[j] || (j % 2)) continue;
+    const r = mulberry(S.seed + j * 71); const px = X((j + 0.5) / N), py = Y(hA[j]);
+    g.fillStyle = ink(0, 0.75); g.beginPath(); g.ellipse(px, py + U * 0.008, U * (0.012 + r() * 0.008), U * 0.007, (r() - 0.5) * 0.4, 0, Math.PI * 2); g.fill();
+  }
+  // 朱印
+  if (S.sealed){
+    const age = mini ? 9 : t - (o.sealT0 || -99);
+    const sc = age < 0.25 ? 1.5 - 0.5 * easeOut(age / 0.25) : 1;
+    drawSeal(g, R.x + R.w * 0.91, R.y + R.h * 0.84, U * 0.08 * sc, S.seed, o.sealInk);
+  }
+}
+function drawPine(g, px, py, s, P, t, mini){
+  const age = mini ? 9 : t - P.t0; const sc = easeOut(age / 0.35); if (sc <= 0.01) return;
+  const rnd = mulberry(P.seed); s *= sc;
+  const tone = P.dense ? 0 : 2, al = P.dense ? 0.92 : 0.55, flat = P.flat;
+  const lean = (rnd() - 0.5) * 0.6, hgt = s * (flat ? 0.72 : 1.05);
+  const pts = [];
+  for (let k = 0; k <= 6; k++){ const u = k / 6; pts.push([px + lean * hgt * u * u * 0.55 + Math.sin(u * 3 + rnd()) * s * 0.03, py - hgt * u]); }
+  g.fillStyle = ink(tone, al); strokePoly(g, pts, u => s * (0.1 - 0.065 * u));
+  const nb = flat ? 3 : 3;
+  for (let j = 0; j < nb; j++){
+    const u = flat ? 0.35 + 0.55 * j / (nb - 1) : 0.5 + 0.5 * j / (nb - 1);
+    const p = pts[Math.round(u * 6)], side = (j % 2 ? 1 : -1) * (j === nb - 1 ? 0.3 : 1);
+    const bw = s * (flat ? 0.85 - 0.15 * j : 0.62 - 0.14 * j), bh = s * (flat ? 0.1 : 0.12);
+    const cx = p[0] + side * bw * (flat ? 0.4 : 0.3), cy = p[1];
+    g.fillStyle = ink(tone, al * 0.85);
+    strokePoly(g, [[p[0], p[1] + s * 0.02], [lerp(p[0], cx, 0.6), cy - bh * 0.15], [cx, cy + bh * 0.1]], tt => s * (0.045 - 0.025 * tt));
+    // 松葉：扇形に広がる短い筆の束
+    g.strokeStyle = ink(tone === 0 ? 0 : 2, al * 0.9); g.lineCap = 'round';
+    const nf = flat ? 9 : 8;
+    for (let k = 0; k < nf; k++){
+      const fx = cx + (k / (nf - 1) - 0.5) * bw * 0.85, fy = cy + (rnd() - 0.5) * bh * 0.3;
+      const a = -Math.PI / 2 + (k / (nf - 1) - 0.5) * 1.5 + (rnd() - 0.5) * 0.3, l = bh * (0.9 + rnd() * 0.7);
+      g.lineWidth = Math.max(0.8, s * (0.022 + rnd() * 0.012));
+      g.beginPath(); g.moveTo(fx, fy + bh * 0.2); g.lineTo(fx + Math.cos(a) * l, fy + Math.sin(a) * l); g.stroke();
+    }
+    g.fillStyle = ink(tone === 0 ? 1 : 3, al * 0.35); g.beginPath(); g.ellipse(cx, cy - bh * 0.3, bw * 0.5, bh * 0.7, 0, 0, 6.28); g.fill();
+  }
+}
+function drawSeal(g, x, y, s, seed, inkOnly){
+  const r = mulberry(seed + 3);
+  g.save(); g.translate(x, y); g.rotate(-0.04);
+  g.fillStyle = inkOnly ? ink(2, 0.55) : SHU + '0.93)';
+  g.beginPath(); const h = s / 2;
+  g.moveTo(-h + r() * s * 0.04, -h); g.lineTo(h, -h + r() * s * 0.04); g.lineTo(h - r() * s * 0.04, h); g.lineTo(-h, h - r() * s * 0.03); g.closePath(); g.fill();
+  // 山と波の印（文字ではない図）
+  g.strokeStyle = PAPER + '0.95)'; g.lineWidth = s * 0.09; g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath(); g.moveTo(-h * 0.65, h * 0.05); g.lineTo(-h * 0.2, -h * 0.55); g.lineTo(h * 0.1, -h * 0.15); g.lineTo(h * 0.35, -h * 0.45); g.lineTo(h * 0.65, h * 0.05); g.stroke();
+  g.beginPath(); g.moveTo(-h * 0.6, h * 0.45); g.quadraticCurveTo(-h * 0.3, h * 0.25, 0, h * 0.45); g.quadraticCurveTo(h * 0.3, h * 0.65, h * 0.6, h * 0.42); g.stroke();
+  g.fillStyle = PAPER + '0.6)';
+  for (let k = 0; k < 9; k++){ g.beginPath(); g.arc((r() - 0.5) * s * 0.95, (r() - 0.5) * s * 0.95, s * (0.015 + r() * 0.03), 0, 6.28); g.fill(); }
+  g.restore();
+}
+
+// ---------------- 音（Web Audio 合成） ----------------
+let AC = null, MG = null, NB = null;
+function ensureAudio(){
+  try {
+    if (!AC){
+      const C = window.AudioContext || window.webkitAudioContext; if (!C) return;
+      AC = new C();
+      MG = AC.createGain(); MG.gain.value = 0.85;
+      const comp = AC.createDynamicsCompressor(); comp.threshold.value = -12; comp.ratio.value = 4;
+      MG.connect(comp); comp.connect(AC.destination);
+      const len = (AC.sampleRate * 0.6) | 0; NB = AC.createBuffer(1, len, AC.sampleRate);
+      const d = NB.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (AC.state === 'suspended') AC.resume().catch(() => {});
+  } catch (e) { AC = null; }
+}
+function envG(gn, t, a, peak, dec){ gn.gain.setValueAtTime(0.0001, t); gn.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + a); gn.gain.exponentialRampToValueAtTime(0.0001, t + a + dec); }
+function sNoise(t, dur, type, freq, q, peak){
+  const s = AC.createBufferSource(); s.buffer = NB;
+  const f = AC.createBiquadFilter(); f.type = type; f.frequency.value = freq; f.Q.value = q;
+  const gn = AC.createGain(); envG(gn, t, 0.002, peak, dur);
+  s.connect(f); f.connect(gn); gn.connect(MG); s.start(t); s.stop(t + dur + 0.05);
+}
+function sOsc(type, t, f0, f1, ft, peak, dec, lp){
+  const o = AC.createOscillator(); o.type = type;
+  o.frequency.setValueAtTime(f0, t); if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + ft);
+  const gn = AC.createGain(); envG(gn, t, 0.004, peak, dec);
+  o.connect(gn);
+  if (lp){ const f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lp; gn.connect(f); f.connect(MG); } else gn.connect(MG);
+  o.start(t); o.stop(t + dec + 0.1);
+}
+function sDon(m, dense, vol, delay, lp){
+  if (!AC) return; vol = vol == null ? 1 : vol;
+  try {
+    const t = AC.currentTime + 0.003 + (delay || 0), f0 = 98 * m;
+    const o = AC.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(f0 * 1.7, t); o.frequency.exponentialRampToValueAtTime(f0, t + 0.035); o.frequency.exponentialRampToValueAtTime(f0 * 0.66, t + 0.55);
+    const gn = AC.createGain(); envG(gn, t, 0.004, (dense ? 0.95 : 0.62) * vol, dense ? 0.7 : 1.1);
+    o.connect(gn);
+    const f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lp || (dense ? 2200 : 700); gn.connect(f); f.connect(MG);
+    o.start(t); o.stop(t + 1.3);
+    sOsc('triangle', t, f0 * 2.4, f0 * 1.5, 0.2, (dense ? 0.22 : 0.08) * vol, 0.22, lp);
+    sNoise(t, dense ? 0.06 : 0.18, 'lowpass', dense ? 1800 : 500, 0.7, (dense ? 0.45 : 0.28) * vol);
+  } catch (e) {}
+}
+function sPon(m, dense, vol){
+  if (!AC) return; vol = vol == null ? 1 : vol;
+  try {
+    const t = AC.currentTime + 0.003, f0 = 294 * m;
+    sOsc('triangle', t, f0 * 1.3, f0 * 0.92, 0.25, (dense ? 0.55 : 0.38) * vol, dense ? 0.3 : 0.55, dense ? 0 : 1400);
+    sOsc('sine', t, f0 * 2.01, f0 * 1.9, 0.2, (dense ? 0.16 : 0.08) * vol, 0.18);
+    if (dense) sNoise(t, 0.025, 'highpass', 2600, 0.7, 0.25 * vol); else sNoise(t, 0.12, 'bandpass', 900, 1.2, 0.12 * vol);
+  } catch (e) {}
+}
+const PENTA = [1, 9 / 8, 5 / 4, 3 / 2, 5 / 3, 2, 9 / 4, 5 / 2];
+function sChime(kind){
+  if (!AC) return;
+  try {
+    const seq = { ridge:[0, 2, 4], lake:[4, 3, 2, 4], path:[0, 1, 2, 3, 4], seal:[0, 2, 4, 5, 7], finish:[5, 4, 2, 0, 2], pick:[2, 4] }[kind] || [0, 2];
+    const base = 587;
+    const t0 = AC.currentTime + 0.02;
+    seq.forEach((n, k) => {
+      const t = t0 + k * (kind === 'seal' ? 0.12 : 0.09), f = base * PENTA[n];
+      sOsc('sine', t, f, 0, 0, 0.22, 1.1);
+      sOsc('sine', t, f * 2.76, 0, 0, 0.05, 0.5);
+      sOsc('sine', t, f * 5.4, 0, 0, 0.02, 0.25);
+    });
+    if (kind === 'seal'){ sOsc('sine', t0, 98, 92, 2, 0.5, 2.6); sOsc('sine', t0, 147, 140, 2, 0.25, 2.2); sOsc('triangle', t0, 196, 0, 0, 0.08, 1.6); }
+  } catch (e) {}
+}
+function sSplash(v){ if (!AC) return; try { sNoise(AC.currentTime + 0.003, 0.22, 'bandpass', 1100, 0.9, 0.22 * v); } catch (e) {} }
+function sStep(){ if (!AC) return; try { sOsc('sine', AC.currentTime + 0.003, 520, 380, 0.06, 0.08, 0.08); } catch (e) {} }
+
+// ---------------- 配置 ----------------
+const LY = { sheet:null, big:null, small:null };
+let paintCv = null, paintG = null;
+const bgCv = document.createElement('canvas'), sheetCv = document.createElement('canvas');
+function readSafe(){
+  const s = getComputedStyle(document.getElementById('safe'));
+  SAFE.t = parseFloat(s.paddingTop) || 0; SAFE.r = parseFloat(s.paddingRight) || 0; SAFE.b = parseFloat(s.paddingBottom) || 0; SAFE.l = parseFloat(s.paddingLeft) || 0;
+}
+function layout(){
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  readSafe();
+  const port = H > W * 1.05;
+  const top = SAFE.t + 10, bot = H - SAFE.b - 8, left = SAFE.l + 10, right = W - SAFE.r - 10;
+  const fullW = right - left, sh = (bot - top) * (port ? 0.53 : 0.58);
+  LY.sheet = { cx:(left + right) / 2, y:top, h:sh, fullW, rolledW:fullW * 0.84, left, right };
+  const zy = top + sh + 14, zh = bot - zy;
+  if (port){
+    const Rb = Math.min(fullW * 0.25, zh * 0.3, Math.min(W, H) * 0.3);
+    LY.big = { x:left + fullW * 0.37, y:zy + zh * 0.36, R:Rb };
+    LY.small = { x:left + fullW * 0.80, y:zy + zh * 0.5, R:Rb * 0.56 };
+  } else {
+    const Rb = Math.min(zh * 0.32, fullW * 0.11);
+    LY.big = { x:left + fullW * 0.37, y:zy + zh * 0.34, R:Rb };
+    LY.small = { x:left + fullW * 0.64, y:zy + zh * 0.47, R:Rb * 0.56 };
+  }
+  LY.port = port;
+  if (!paintCv){ paintCv = document.createElement('canvas'); paintG = paintCv.getContext('2d'); }
+  paintCv.width = Math.ceil(fullW * DPR) + 2; paintCv.height = Math.ceil(sh * DPR) + 2;
+  G.dirty = true; G.paintW = -1;
+  for (const it of G.gallery) it.cv = null;
+  // 静的な紙を一度だけ描いておく
+  bgCv.width = cv.width; bgCv.height = cv.height;
+  const bg = bgCv.getContext('2d'); bg.setTransform(DPR, 0, 0, DPR, 0, 0); bg.fillStyle = bg.createPattern(paperBgCv, 'repeat'); bg.fillRect(0, 0, W, H);
+  sheetCv.width = Math.ceil(fullW * DPR) + 2; sheetCv.height = Math.ceil(sh * DPR) + 2;
+  const sg = sheetCv.getContext('2d'); sg.setTransform(DPR, 0, 0, DPR, 0, 0); sg.fillStyle = sg.createPattern(paperSheetCv, 'repeat'); sg.fillRect(0, 0, fullW + 2, sh + 2);
+  const eg = sg.createLinearGradient(0, 0, 0, sh); eg.addColorStop(0, 'rgba(150,130,100,0.08)'); eg.addColorStop(0.1, 'rgba(150,130,100,0)'); eg.addColorStop(0.92, 'rgba(150,130,100,0)'); eg.addColorStop(1, 'rgba(150,130,100,0.1)');
+  sg.fillStyle = eg; sg.fillRect(0, 0, fullW + 2, sh + 2);
+}
+
+// ---------------- 状態 ----------------
+const SONGS = [{T:0.8, m:1}, {T:0.7, m:1.122}, {T:0.9, m:0.891}];
+const G = {
+  t:0, phase:'paint', phaseT0:0, song:0, sheet:null, hDisp:new Float32Array(N),
+  cursor:0.15, progress:0, hits:0, minHits:24, need:0.75,
+  beatT0:null, lastHit:-99, lastInput:0, seq:[], smallRun:[], jobs:[], signal:null, signalAt:-1,
+  boat:null, walker:null, waves:[], echoes:[], parts:[], bursts:[], route:null,
+  gallery:[], src:null, demo:null, demoDone:{}, sealT0:-99, lakeN:0, lakeTot:0,
+  child:{ x:0.08, hopT:-99, wideT:-99, pointT:-99, wigT:-99, swingT:-99, bowT:-99, lastGest:0 },
+  drums:{ big:{pressT:-99, lastT:-99, step:0, wob:-99}, small:{pressT:-99, lastT:-99, step:0, wob:-99} },
+  lastDrum:null, lastLand:{x:0.15}, paperWob:-99, dirty:true, paintW:-1, pick:-1, pickT0:0, finishT0:0,
+  stats:{ ridge:0, lake:0, path:0, shore:0, liftRun:0, seal:0, waveHop:0, echo:0, songs:0 }
+};
+function startSong(sheet){
+  G.sheet = sheet; G.hDisp = new Float32Array(sheet.h);
+  G.cursor = 0.15; G.progress = 0; G.hits = 0;
+  const first = G.stats.songs === 0;
+  G.minHits = first ? 34 : 12; G.need = first ? 0.9 : 0.42;
+  G.beatT0 = null; G.seq = []; G.smallRun = []; G.jobs = []; G.signal = null; G.signalAt = -1;
+  G.boat = null; G.walker = null; G.waves = []; G.echoes = []; G.route = null;
+  const sp = lakeSpans(sheet); G.lakeN = sp.length; G.lakeTot = sp.reduce((s, q) => s + q[1] - q[0] + 1, 0);
+  G.child.x = 0.08; G.lastLand = {x:G.cursor}; G.dirty = true;
+}
+
+function now(){ return G.t + clamp(performance.now() / 1000 - lastReal, 0, 0.05); }
+function songCfg(){ return SONGS[G.song % SONGS.length]; }
+function sheetW(){
+  const s = LY.sheet, p = G.phase, e = (t) => clamp((G.t - G.phaseT0) / t, 0, 1);
+  if (p === 'paint' || p === 'seal') return s.rolledW;
+  if (p === 'unroll') return lerp(s.rolledW, s.fullW, easeInOut(e(1.3)));
+  if (p === 'move' || p === 'finish') return s.fullW;
+  if (p === 'rollup') return lerp(s.fullW, s.fullW * 0.04, easeInOut(e(1.1)));
+  if (p === 'open') return lerp(s.fullW * 0.04, s.rolledW, easeInOut(e(0.9)));
+  return s.fullW * 0.04;
+}
+function sheetRect(){ const w = sheetW(), s = LY.sheet; let ox = 0; const pw = G.t - G.paperWob; if (pw < 0.4) ox = Math.sin(pw * 40) * 2.5 * (1 - pw / 0.4); return { x:s.cx - w / 2 + ox, y:s.y, w, h:s.h }; }
+
+// ---------------- 入力 ----------------
+function drumHitTest(x, y){
+  let best = null, bd = 1;
+  for (const name of ['big', 'small']){
+    const d = LY[name]; const nx = (x - d.x) / (d.R * 1.2), ny = (y - (d.y + d.R * 0.32)) / (d.R * 0.98);
+    const v = nx * nx + ny * ny; if (v <= bd){ bd = v; best = name; }
+  }
+  return best;
+}
+function gallerySlots(){
+  const s = LY.sheet, items = G.gallery.length + 1, out = [];
+  const cols = 2, rows = 2, gw = s.fullW, gh = s.h, cw = gw / cols, ch = gh / rows;
+  const asp = s.fullW / s.h;
+  let mw = cw * 0.86, mh = mw / asp; if (mh > ch * 0.8){ mh = ch * 0.8; mw = mh * asp; }
+  for (let k = 0; k < items; k++){
+    const cx = s.left + cw * (k % cols + 0.5), cy = s.y + ch * (Math.floor(k / cols) + 0.5);
+    out.push({ x:cx - mw / 2, y:cy - mh / 2, w:mw, h:mh, idx:k < G.gallery.length ? k : -1 });
+  }
+  return out;
+}
+const lastPtr = new Map();
+function onDown(e){
+  e.preventDefault();
+  ensureAudio();
+  const x = e.clientX, y = e.clientY, t = now();
+  G.lastInput = t;
+  if (G.demo){ G.demo = null; }
+  const dn = drumHitTest(x, y);
+  if (dn){ hitDrum(dn, t); return; }
+  if (G.phase === 'gallery'){
+    for (const sl of gallerySlots()){
+      if (x >= sl.x - 8 && x <= sl.x + sl.w + 8 && y >= sl.y - 8 && y <= sl.y + sl.h + 8){ pickSheet(sl.idx); return; }
+    }
+    return;
+  }
+  // 関係ない場所：小さく揺れるだけ
+  const R = sheetRect(), M = sceneMap(R), c = childPos(M);
+  if (Math.abs(x - c.x) < M.U * 0.12 && y > c.y - M.U * 0.25 && y < c.y + M.U * 0.02){ G.child.wigT = t; return; }
+  if (x > R.x && x < R.x + R.w && y > R.y && y < R.y + R.h) G.paperWob = t;
+}
+cv.addEventListener('pointerdown', onDown, {passive:false});
+for (const ev of ['pointerup', 'pointercancel', 'pointerleave', 'pointerout', 'lostpointercapture']) cv.addEventListener(ev, e => { lastPtr.delete(e.pointerId); }, {passive:true});
+document.addEventListener('touchstart', e => { if (e.cancelable) e.preventDefault(); }, {passive:false});
+document.addEventListener('touchmove', e => { if (e.cancelable) e.preventDefault(); }, {passive:false});
+document.addEventListener('touchend', () => { ensureAudio(); }, {passive:true});
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend', 'contextmenu', 'dblclick', 'selectstart']) document.addEventListener(ev, e => e.preventDefault(), {passive:false});
+window.addEventListener('wheel', e => e.preventDefault(), {passive:false});
+
+// ---------------- 打つ ----------------
+function addPart(x, y, vx, vy, r, tone, life){
+  if (G.parts.length >= MAX_PARTS) G.parts.shift();
+  G.parts.push({x, y, vx, vy, r, tone, life, t0:G.t});
+}
+function hitDrum(name, t){
+  const D = G.drums[name];
+  if (t - D.lastT < 0.05) return;        // 多指連打の暴走防止
+  const cfg = songCfg();
+  // 拍の判定（初打・休みの後は入力に合わせて起点を作る）
+  let dense = true;
+  if (G.beatT0 === null || t - G.lastHit > 3.0){ G.beatT0 = t; }
+  else { const ph = (t - G.beatT0) / cfg.T; const fr = ph - Math.round(ph); dense = Math.abs(fr) * cfg.T < 0.15; }
+  G.lastHit = t;
+  // 連打で音程が上がる
+  D.step = (t - D.lastT < 0.5) ? (D.step + 1) % 5 : 0; D.lastT = t; D.pressT = t;
+  const m = cfg.m * PENTA[D.step];
+  if (name === 'big') sDon(m, dense); else sPon(m, dense);
+  G.bursts.push({name, t0:t, dense}); if (G.bursts.length > 6) G.bursts.shift();
+  const d = LY[name];
+  const np = name === 'big' ? 6 : 4;
+  for (let k = 0; k < np; k++){ const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.6; const sp = d.R * (2.2 + Math.random() * 2.4); addPart(d.x + (Math.random() - 0.5) * d.R * 0.6, d.y, Math.cos(a) * sp, Math.sin(a) * sp, d.R * (0.025 + Math.random() * 0.03), dense ? 0 : 3, 0.7); }
+  G.lastDrum = name;
+  if (G.phase === 'paint') paintHit(name, dense, t);
+  else if (G.phase === 'move') moveHit(name, dense, t);
+}
+
+function paintHit(name, dense, t){
+  const S = G.sheet;
+  if (G.signal && G.signal.drum === name){ doSeal(t); return; }
+  let x = G.cursor; let adv = 0; let near = lakeNear(S, x, 6);
+  // 小さすぎる湖は岸で狭めない（舟の道を残す）
+  if (near && dense){ const c = col(x); const sp = lakeSpans(S).find(q => c >= q[0] - 6 && c <= q[1] + 6); if (!sp || sp[1] - sp[0] + 1 < 9) near = false; }
+  // 湖のそばの濃い一打は、いちばん近い岸へ落ちる
+  if (near && dense){ const ec = nearestLakeEdge(S, x); if (ec >= 0) x = (ec + 0.5) / N; }
+  let landX = x;
+  G.child.swingT = t;
+  if (name === 'big'){
+    if (dense){
+      let tx = x, sig = 0.055;
+      const run = G.smallRun.filter(p => p.flat);
+      const lifted = run.length >= 2;
+      if (lifted){ let mn = 1, mx = 0; for (const p of run){ mn = Math.min(mn, p.x); mx = Math.max(mx, p.x); } tx = (mn + mx) / 2; sig = Math.max(0.055, (mx - mn) / 2 + 0.03); G.stats.liftRun++; }
+      const hb = hAt(S.h, tx);
+      if (near && !lifted){
+        addBump(S, tx, 0.07, 0.006, 0.12); addRock(S, tx, 0.6, 0.008);
+        S.shore[col(tx)] = 1;
+        G.stats.shore++;
+      } else {
+        addBump(S, tx, lifted ? 0.16 : 0.13, sig, 0.46, true); addRock(S, tx, 0.5, sig);
+      }
+      const ha = hAt(S.h, tx);
+      pushDot({x:tx, big:1, dense:1, r:0.026 * (0.9 + Math.random() * 0.2), hc:hb + (ha - hb) * 0.55, ha, t0:t, seed:newSeed()});
+      landX = tx;
+      adv = lifted ? 0 : 0.022;
+      if (hAt(S.h, x) > 0.42) adv += 0.06;
+      queueRidge(tx);
+      for (let k = 0; k < 4; k++) splash(tx, 0);
+    } else {
+      const hb = hAt(S.h, x);
+      addMist(S, x, 0.42, 0.065); addBump(S, x, 0.02, 0.06, 0.04);
+      // 薄墨が深く重なると山裾がにじんで低くなり、水がたまる
+      for (let i = 0; i < N; i++) if (S.w[i] > 1.3 && S.h[i] > 0.04 && Math.abs((i + 0.5) / N - x) < 0.1){ S.h[i] = Math.max(0.035, S.h[i] * 0.72); S.rock[i] *= 0.85; }
+      pushDot({x, big:1, dense:0, r:0.04, hc:near ? 0 : hb, ha:near ? 0 : hAt(S.h, x), t0:t, seed:newSeed()});
+      adv = 0.03; G.child.wideT = t;
+    }
+    G.smallRun = [];
+  } else {
+    const hb = hAt(S.h, x);
+    if (near && dense){ addBump(S, x, 0.035, 0.012, 0.06); S.shore[col(x)] = 1; }
+    if (!dense) addMist(S, x, 0.24, 0.045);
+    // 近くの松は育つ、なければ新しく立つ
+    let P = null; for (const p of S.pines){ if (Math.abs(p.x - x) < 0.012){ P = p; break; } }
+    if (P){ P.s = Math.min(1.45, P.s + 0.12); if (dense) P.dense = 1; P.t0 = t - 0.2; }
+    else {
+      if (S.pines.length >= MAX_PINES) S.pines.shift();
+      P = {x, dense:dense ? 1 : 0, flat:hb < 0.04, s:dense ? 1 : 0.75, seed:newSeed(), t0:t};
+      S.pines.push(P);
+    }
+    G.smallRun.push(P);
+    pushDot({x, big:0, dense:dense ? 1 : 0, r:dense ? 0.013 : 0.02, hc:0, ha:0, t0:t, seed:newSeed()});
+    adv = 0.042; if (!dense) G.child.wideT = t;
+  }
+  G.lastLand = {x:landX};
+  // 大小交互 → 坂道
+  G.seq.push({name, x:landX});
+  if (G.seq.length > 4) G.seq.shift();
+  if (G.seq.length === 4 && G.seq[0].name !== G.seq[1].name && G.seq[1].name !== G.seq[2].name && G.seq[2].name !== G.seq[3].name){
+    let mn = 1, mx = 0; for (const q of G.seq){ mn = Math.min(mn, q.x); mx = Math.max(mx, q.x); }
+    mn = Math.max(0.02, mn - 0.03); mx = Math.min(0.98, mx + 0.03);
+    const overl = S.paths.some(p => Math.min(p.x1, mx) - Math.max(p.x0, mn) > (mx - mn) * 0.5);
+    if (!overl && mx - mn > 0.06){ const p = {x0:mn, x1:mx, prog:0}; S.paths.push(p); G.jobs.push({type:'path', x0:mn, x1:mx, path:p, t0:-1, dur:0.5 + (mx - mn) * 3}); G.seq = []; }
+  }
+  // 湖ができたか
+  const sp = lakeSpans(S), tot = sp.reduce((s, q) => s + q[1] - q[0] + 1, 0);
+  if (sp.length > G.lakeN || (sp.length < G.lakeN && tot >= G.lakeTot && tot > 0)){ achieve('lake', landX); G.stats.lake++; }
+  G.lakeN = sp.length; G.lakeTot = tot;
+  // 落ち先を進める
+  G.cursor += adv; G.progress += adv; G.hits++;
+  if (G.cursor > 0.93) G.cursor = 0.08;
+  if (!G.signal && G.signalAt < 0 && G.progress >= G.need && G.hits >= G.minHits) G.signalAt = t + 0.9;
+  G.dirty = true;
+}
+function pushDot(d){ const S = G.sheet; S.dots.push(d); if (S.dots.length > MAX_DOTS){ const k = S.dots.findIndex(q => !q.dense); S.dots.splice(k >= 0 ? k : 0, 1); } }
+function splash(xn, tone){
+  const R = sheetRect(), M = sceneMap(R); const px = M.X(xn), py = M.Y(hAt(G.hDisp, xn));
+  const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.4, sp = M.U * (0.3 + Math.random() * 0.4);
+  addPart(px, py, Math.cos(a) * sp, Math.sin(a) * sp, M.U * (0.004 + Math.random() * 0.005), tone, 0.5);
+}
+function queueRidge(x){
+  const S = G.sheet; const c = col(x);
+  if (S.h[c] < 0.04) return;
+  let a = c, b = c; while (a > 0 && S.h[a - 1] > 0.04) a--; while (b < N - 1 && S.h[b + 1] > 0.04) b++;
+  const x0 = a / N, x1 = (b + 1) / N;
+  let nd = 0; for (const d of S.dots) if (d.big && d.dense && d.x >= x0 && d.x <= x1) nd++;
+  let unc = false; for (let i = a; i <= b; i++) if (!S.conn[i]) { unc = true; break; }
+  if (nd < 2 || !unc) return;
+  for (const j of G.jobs){ if (j.type === 'ridge' && j.t0 < 0 && Math.min(j.x1, x1) > Math.max(j.x0, x0)){ j.x0 = Math.min(j.x0, x0); j.x1 = Math.max(j.x1, x1); return; } }
+  G.jobs.push({type:'ridge', x0, x1, t0:-1, dur:0.45 + (x1 - x0) * 2.5});
+}
+function achieve(kind, x){
+  sChime(kind);
+  const c = G.child; c.hopT = G.t; c.pointT = G.t + 0.35;
+  if (kind === 'lake') c.wideT = G.t;
+}
+
+function doSeal(t){
+  const S = G.sheet;
+  G.signal = null; G.signalAt = -1;
+  S.sealed = true; G.sealT0 = t; G.stats.seal++;
+  sChime('seal');
+  // 残っている仕事をすぐ仕上げる
+  for (const j of G.jobs) finishJob(j, true);
+  G.jobs = [{type:'grand', x0:0, x1:1, t0:t + 0.4, dur:1.6}];
+  setPhase('seal');
+  G.dirty = true;
+}
+function finishJob(j, silent){
+  const S = G.sheet;
+  if (j.type === 'ridge'){ for (let i = col(j.x0); i <= Math.min(N - 1, col(j.x1)); i++) if (S.h[i] > 0.006) S.conn[i] = 1; if (!silent){ achieve('ridge', j.x1); G.stats.ridge++; } }
+  if (j.type === 'path'){ j.path.prog = 1; if (!silent){ achieve('path', j.x1); G.stats.path++; } }
+  if (j.type === 'grand'){ for (let i = 0; i < N; i++) if (S.h[i] > 0.012) S.conn[i] = 1; S.far = 1; }
+}
+function setPhase(p){ G.phase = p; G.phaseT0 = G.t; }
+
+// ---------------- 動く絵 ----------------
+function setupMove(){
+  const S = G.sheet; const sp = lakeSpans(S);
+  let best = null; for (const q of sp) if (!best || q[1] - q[0] > best[1] - best[0]) best = q;
+  G.waves = []; G.echoes = [];
+  if (best && best[1] - best[0] + 1 >= 6){
+    const xa = (best[0] + 1) / N, xb = (best[1]) / N;
+    G.route = {xa, xb};
+    G.boat = {x:xa + 0.01, dir:1, v:0, hopT:-99, legs:0, t0:G.t, tilt:0};
+    G.walker = null;
+  } else {
+    G.route = null; G.boat = null;
+    G.walker = {x:0.03, v:0, hopT:-99, t0:G.t};
+  }
+}
+function tallestPeakNear(x){
+  const S = G.sheet; let bi = -1, bh = 0.1;
+  for (let i = 0; i < N; i++){ const h = S.h[i] - Math.abs((i + 0.5) / N - x) * 0.25; if (S.h[i] > 0.1 && h > bh){ bh = h; bi = i; } }
+  return bi < 0 ? null : {x:(bi + 0.5) / N, h:S.h[bi]};
+}
+function moveHit(name, dense, t){
+  const amp = dense ? 1 : 0.7;
+  if (G.boat){
+    const B = G.boat, r = G.route;
+    if (name === 'small'){
+      G.waves.push({x:clamp(B.x - B.dir * 0.07, r.xa, r.xb), dir:B.dir, kind:'s', amp, t0:t, hit:false});
+    } else {
+      const pk = tallestPeakNear(B.x);
+      let from = pk ? clamp(pk.x, r.xa, r.xb) : r.xa;
+      let dir = pk ? Math.sign(B.x - pk.x) || 1 : 1;
+      if (pk) echo(pk, t); else sDon(songCfg().m * 0.98, false, 0.3, 0.35, 600);
+      if (Math.abs(from - B.x) < 0.02) from = clamp(B.x - dir * 0.05, r.xa, r.xb);
+      G.waves.push({x:from, dir, kind:'b', amp, t0:t, hit:false});
+    }
+  } else if (G.walker){
+    const Wk = G.walker;
+    if (name === 'small'){ Wk.hopT = t; Wk.v += 0.03 * amp; sStep(); G.stats.waveHop++; }
+    else { const pk = tallestPeakNear(Wk.x); if (pk) echo(pk, t); Wk.v += 0.05 * amp; Wk.hopT = t; }
+  }
+  if (G.waves.length > 10) G.waves.shift();
+}
+function echo(pk, t){
+  G.echoes.push({x:pk.x, h:pk.h, t0:t}); G.echoes.push({x:pk.x, h:pk.h, t0:t + 0.38});
+  if (G.echoes.length > 8) G.echoes.splice(0, 2);
+  const m = songCfg().m * PENTA[G.drums.big.step];
+  sDon(m, false, 0.34, 0.38, 650); sDon(m, false, 0.16, 0.76, 450);
+  G.stats.echo++;
+}
+function updateMove(dt){
+  const t = G.t;
+  if (G.boat){
+    const B = G.boat, r = G.route;
+    for (const w of G.waves){
+      const sp = w.kind === 's' ? 0.22 : 0.3;
+      w.x += w.dir * sp * dt;
+      if (!w.hit && Math.abs(w.x - B.x) < 0.012){
+        w.hit = true;
+        if (w.kind === 's'){ B.hopT = t; B.v += 0.035 * w.amp; G.stats.waveHop++; sSplash(0.6); }
+        else { B.dir = w.dir; B.v += 0.07 * w.amp; B.hopT = t; sSplash(1); }
+      }
+    }
+    G.waves = G.waves.filter(w => w.x >= r.xa - 0.02 && w.x <= r.xb + 0.02 && t - w.t0 < 6);
+    B.v *= Math.exp(-dt * 1.1);
+    B.x += B.dir * (0.012 + B.v) * dt;
+    if (B.x >= r.xb){ B.x = r.xb; B.dir = -1; B.legs++; sSplash(0.5); }
+    if (B.x <= r.xa){ B.x = r.xa; B.dir = 1; B.legs++; sSplash(0.5); }
+    if (B.legs >= 4 && G.phase === 'move'){ setPhase('finish'); sChime('finish'); G.child.hopT = t; G.child.bowT = t + 0.6; }
+  }
+  if (G.walker){
+    const Wk = G.walker;
+    Wk.v *= Math.exp(-dt * 1.2);
+    const slope = (hAt(G.sheet.h, Wk.x + 0.01) - hAt(G.sheet.h, Wk.x - 0.01)) / 0.02;
+    const onPath = G.sheet.paths.some(p => Wk.x >= p.x0 && Wk.x <= p.x1);
+    const sv = clamp(1 - Math.max(0, slope) * (onPath ? 0.08 : 0.18), 0.35, 1.2);
+    Wk.x += (0.011 + Wk.v) * sv * dt;
+    if (Wk.x >= 0.97 && G.phase === 'move'){ Wk.x = 0.97; setPhase('finish'); sChime('finish'); G.child.hopT = t; G.child.bowT = t + 0.6; }
+  }
+  G.echoes = G.echoes.filter(e => t - e.t0 < 1.4);
+}
+
+// ---------------- 巻物の棚 ----------------
+function archiveSheet(){
+  const S = cloneSheet(G.sheet); S.sealed = true;
+  G.gallery.push({sheet:S, cv:null});
+  while (G.gallery.length > 3){
+    let k = G.gallery.findIndex(it => it.sheet !== G.src);
+    if (k < 0 || k === G.gallery.length - 1) k = 0;
+    G.gallery.splice(k, 1);
+  }
+  G.stats.songs++;
+}
+function pickSheet(idx){
+  const t = G.t;
+  let base;
+  if (idx >= 0){ G.src = G.gallery[idx].sheet; base = cloneSheet(G.src); base.sealed = false; base.far = 0; }
+  else { G.src = null; base = newSheet(); }
+  G.song++;
+  sChime('pick');
+  startSong(base);
+  setPhase('open');
+  G.lastInput = t;
+}
+function miniCanvas(it, w, h){
+  if (it.cv && it.cv.width === Math.ceil(w * DPR)) return it.cv;
+  const c = document.createElement('canvas'); c.width = Math.ceil(w * DPR); c.height = Math.ceil(h * DPR);
+  const g = c.getContext('2d'); g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.fillStyle = pat(g, 'sheet'); g.fillRect(0, 0, w, h);
+  renderSheet(g, it.sheet, it.sheet.h, {x:0, y:0, w, h}, {mini:true, sealInk:true, t:0});
+  it.cv = c; return c;
+}
+
+// ---------------- 更新 ----------------
+function highlightTarget(){
+  const p = G.phase;
+  if (p === 'paint'){ if (G.signal) return G.signal.drum; if (!G.lastDrum) return 'big'; return G.lastDrum === 'big' ? 'small' : 'big'; }
+  if (p === 'move'){ if (!G.lastDrum || G.lastDrum === 'big') return 'small'; return 'big'; }
+  if (p === 'gallery') return 'slot';
+  return null;
+}
+function update(dt){
+  const t = G.t, S = G.sheet;
+  // 地形の表示を目標へ
+  let moving = false;
+  for (let i = 0; i < N; i++){ const d = S.h[i] - G.hDisp[i]; if (Math.abs(d) > 0.0004){ G.hDisp[i] += d * Math.min(1, dt * 9); moving = true; } else G.hDisp[i] = S.h[i]; }
+  if (moving) G.dirty = true;
+  for (const d of S.dots) if (t - d.t0 < 0.95){ G.dirty = true; break; }
+  if (!G.dirty) for (const p of S.pines) if (t - p.t0 < 0.4){ G.dirty = true; break; }
+  if (t - G.sealT0 < 0.3) G.dirty = true;
+  // 子の筆仕事
+  const j = G.jobs[0];
+  if (j){
+    if (j.t0 < 0) j.t0 = t + 0.12;
+    const p = (t - j.t0) / j.dur;
+    if (p >= 0){
+      const xx = lerp(j.x0, j.x1, clamp(p, 0, 1));
+      if (j.type === 'ridge'){ for (let i = col(j.x0); i <= col(xx); i++) if (S.h[i] > 0.006) S.conn[i] = 1; }
+      if (j.type === 'path') j.path.prog = clamp(p, 0, 1);
+      if (j.type === 'grand'){ for (let i = 0; i <= col(xx); i++) if (S.h[i] > 0.012) S.conn[i] = 1; S.far = clamp(p, 0, 1); }
+      G.dirty = true;
+      if (p >= 1){ G.jobs.shift(); finishJob(j, j.type === 'grand'); if (j.type === 'grand'){ setPhase('unroll'); } }
+    }
+  }
+  // 朱の合図
+  if (G.phase === 'paint' && G.signalAt > 0 && t >= G.signalAt && G.jobs.length === 0){ G.signal = {drum:'big', t0:t}; G.signalAt = -1; G.child.pointT = t; }
+  // 段階の遷移
+  if (G.phase === 'unroll'){ G.dirty = true; if (t - G.phaseT0 > 1.3){ setupMove(); setPhase('move'); } }
+  if (G.phase === 'move' || G.phase === 'finish') updateMove(dt);
+  if (G.phase === 'finish' && t - G.phaseT0 > 2.4){ setPhase('rollup'); }
+  if (G.phase === 'rollup'){ G.dirty = true; if (t - G.phaseT0 > 1.15){ archiveSheet(); setPhase('gallery'); G.lastInput = t; } }
+  if (G.phase === 'open'){ G.dirty = true; if (t - G.phaseT0 > 0.9){ setPhase('paint'); G.lastInput = t; } }
+  // 粒子
+  for (const p of G.parts){ p.vy += 900 * dt * (LY.big.R / 100); p.x += p.vx * dt; p.y += p.vy * dt; }
+  G.parts = G.parts.filter(p => t - p.t0 < p.life);
+  G.bursts = G.bursts.filter(b => t - b.t0 < 0.5);
+  // お手本の手（各段階で一度だけ）
+  const idle = t - G.lastInput;
+  const key = G.phase === 'paint' ? (G.signal ? 'signal' : 'paint') : G.phase;
+  if (!G.demo && idle > 4 && (key === 'paint' || key === 'signal' || key === 'move' || key === 'gallery') && !G.demoDone[key] && G.jobs.length === 0){
+    G.demoDone[key] = true; G.demo = {key, t0:t, target:highlightTarget()};
+  }
+  if (G.demo){
+    const p = (t - G.demo.t0) / 1.9;
+    if (!G.demo.pressed && p > 0.45 && G.demo.target !== 'slot'){ G.demo.pressed = true; G.drums[G.demo.target].pressT = t; }
+    if (p >= 1) G.demo = null;
+  }
+  // 子のしぐさ：待っている間は対象を指す
+  const c = G.child;
+  if (idle > 2.5 && t - c.lastGest > 3.2 && (G.phase === 'paint' || G.phase === 'move' || G.phase === 'gallery')){ c.lastGest = t; c.pointT = t; }
+  // 子の位置
+  let tx;
+  if (j && j.t0 >= 0 && t >= j.t0) tx = lerp(j.x0, j.x1, clamp((t - j.t0) / j.dur, 0, 1)) - 0.06;
+  else if (G.phase === 'paint') tx = G.cursor - 0.07;
+  else if (G.boat) tx = G.boat.x < 0.3 ? 0.9 : 0.05;
+  else if (G.phase === 'seal') tx = c.x;
+  else tx = 0.06;
+  tx = clamp(tx, 0.03, 0.9);
+  c.x += (tx - c.x) * Math.min(1, dt * (j ? 7 : 3));
+}
+
+// ---------------- 描画 ----------------
+function childPos(M){ return {x:M.X(G.child.x), y:M.base + M.U * 0.31}; }
+function brushTip(M){
+  const t = G.t, j = G.jobs[0];
+  if (j && j.t0 >= 0 && t >= j.t0 && G.phase !== 'gallery'){
+    const xx = lerp(j.x0, j.x1, clamp((t - j.t0) / j.dur, 0, 1));
+    let hh = hAt(G.hDisp, xx); if (j.type === 'path') hh = hh * 0.5;
+    return {x:M.X(xx), y:M.Y(hh) - M.U * 0.004, active:true};
+  }
+  if (G.phase === 'paint' || G.phase === 'seal' || G.phase === 'open'){
+    const st = t - G.child.swingT;
+    const lx = st < 0.45 ? G.lastLand.x : G.cursor;
+    const down = st < 0.07 ? st / 0.07 : Math.max(0, 1 - (st - 0.07) / 0.3);
+    const hh = hAt(G.hDisp, lx);
+    return {x:M.X(lx), y:M.Y(hh) - M.U * (0.12 * (1 - down) + 0.01) + Math.sin(t * 2) * M.U * 0.004 * (1 - down), active:down > 0};
+  }
+  return null;
+}
+function drawChild(g, M, cx, fy, ch, opt){
+  const t = G.t, c = G.child;
+  let hop = 0; const ht = t - c.hopT; if (ht >= 0 && ht < 0.45) hop = Math.sin(ht / 0.45 * Math.PI) * ch * 0.16;
+  if (opt.hop) hop += opt.hop;
+  let bob = 0;
+  if (G.beatT0 !== null && t - G.lastHit < 3){ const ph = ((t - G.beatT0) / songCfg().T) % 1; bob = Math.pow(Math.max(0, Math.cos(ph * Math.PI * 2)), 6) * ch * 0.025; }
+  let wig = 0; const wt = t - c.wigT; if (wt < 0.5) wig = Math.sin(wt * 30) * 0.08 * (1 - wt / 0.5);
+  let bow = 0; const bt = t - c.bowT; if (bt > 0 && bt < 1.2) bow = Math.sin(bt / 1.2 * Math.PI) * 0.35;
+  const y0 = fy - hop;
+  g.save(); g.translate(cx, y0); g.rotate(wig); g.scale(opt.face || 1, 1);
+  const u = ch;
+  // 影
+  g.fillStyle = ink(3, 0.18); g.beginPath(); g.ellipse(0, hop + u * 0.01, u * 0.2, u * 0.03, 0, 0, 6.28); g.fill();
+  // 足
+  g.fillStyle = ink(1, 0.85);
+  const step = opt.walk ? Math.sin(t * 10) * u * 0.04 : 0;
+  strokePoly(g, [[-u * 0.07, -u * 0.22], [-u * 0.08 + step, 0]], () => u * 0.045);
+  strokePoly(g, [[u * 0.07, -u * 0.22], [u * 0.08 - step, 0]], () => u * 0.045);
+  g.save(); g.translate(0, -u * 0.2); g.rotate(bow); g.translate(0, u * 0.2);
+  // 着物
+  const sy = -u * 0.6 + bob;
+  g.fillStyle = ink(2, 0.42);
+  g.beginPath(); g.moveTo(-u * 0.14, sy); g.lineTo(u * 0.14, sy); g.lineTo(u * 0.25, -u * 0.17); g.quadraticCurveTo(0, -u * 0.13, -u * 0.25, -u * 0.17); g.closePath(); g.fill();
+  g.fillStyle = ink(0, 0.85);
+  strokePoly(g, [[-u * 0.14, sy], [-u * 0.2, -u * 0.38], [-u * 0.26, -u * 0.17]], tt => u * (0.035 - 0.02 * tt));
+  strokePoly(g, [[u * 0.14, sy], [u * 0.2, -u * 0.38], [u * 0.26, -u * 0.17]], tt => u * (0.03 - 0.018 * tt));
+  strokePoly(g, [[-u * 0.06, sy], [u * 0.02, -u * 0.44]], tt => u * (0.025 - 0.012 * tt));
+  // 帯
+  g.fillStyle = ink(0, 0.9); g.beginPath(); g.moveTo(-u * 0.18, -u * 0.42 + bob * 0.5); g.lineTo(u * 0.18, -u * 0.42 + bob * 0.5); g.lineTo(u * 0.19, -u * 0.36); g.lineTo(-u * 0.19, -u * 0.36); g.closePath(); g.fill();
+  // 頭
+  const hy = -u * 0.78 + bob;
+  g.fillStyle = 'rgb(245,238,224)'; g.beginPath(); g.arc(0, hy, u * 0.16, 0, 6.28); g.fill();
+  g.fillStyle = ink(1, 0.85); g.beginPath(); g.arc(0, hy, u * 0.165, Math.PI * 0.15, Math.PI * 0.55); g.arc(0, hy, u * 0.15, Math.PI * 0.55, Math.PI * 0.15, true); g.fill();
+  // 髪（おかっぱ＋お団子）
+  g.fillStyle = ink(0, 0.92); g.beginPath();
+  g.moveTo(-u * 0.175, hy + u * 0.07); g.quadraticCurveTo(-u * 0.21, hy - u * 0.2, 0, hy - u * 0.19); g.quadraticCurveTo(u * 0.21, hy - u * 0.2, u * 0.175, hy + u * 0.07);
+  g.lineTo(u * 0.13, hy + u * 0.075); g.lineTo(u * 0.12, hy - u * 0.04); g.quadraticCurveTo(0, hy - u * 0.09, -u * 0.12, hy - u * 0.04); g.lineTo(-u * 0.13, hy + u * 0.075); g.closePath(); g.fill();
+  g.beginPath(); g.arc(-u * 0.02, hy - u * 0.22, u * 0.065, 0, 6.28); g.fill();
+  g.strokeStyle = PAPER + '0.5)'; g.lineWidth = 1; g.beginPath(); g.arc(-u * 0.02, hy - u * 0.22, u * 0.04, 3.6, 5.4); g.stroke();
+  // 目（視線）
+  const lk = opt.look || {x:0, y:1};
+  const ex = lk.x * u * 0.03 * (opt.face || 1), ey = lk.y * u * 0.02;
+  const wide = t - c.wideT < 1.1;
+  for (const s of [-1, 1]){
+    const x = s * u * 0.06 + ex, y = hy + u * 0.02 + ey;
+    if (wide){ g.fillStyle = 'rgb(250,246,236)'; g.beginPath(); g.arc(x, y, u * 0.032, 0, 6.28); g.fill(); g.strokeStyle = ink(0, 0.8); g.lineWidth = Math.max(1, u * 0.012); g.stroke(); g.fillStyle = ink(0, 0.95); g.beginPath(); g.arc(x + ex * 0.3, y + ey * 0.3, u * 0.014, 0, 6.28); g.fill(); }
+    else { g.fillStyle = ink(0, 0.95); g.beginPath(); g.ellipse(x, y, u * 0.016, u * 0.021, 0, 0, 6.28); g.fill(); }
+  }
+  // 口
+  g.strokeStyle = ink(1, 0.8); g.lineWidth = Math.max(1, u * 0.012); g.beginPath();
+  if (wide){ g.arc(ex * 0.5, hy + u * 0.095, u * 0.018, 0, 6.28); } else { g.arc(ex * 0.5, hy + u * 0.075, u * 0.03, 0.4, Math.PI - 0.4); }
+  g.stroke();
+  // 指さし
+  const pt = t - c.pointT;
+  if (pt >= 0 && pt < 1.2 && opt.pointTo){
+    const k = Math.sin(clamp(pt / 1.2, 0, 1) * Math.PI);
+    const ax = opt.pointTo.x * (opt.face || 1), ay = opt.pointTo.y;
+    const l = Math.hypot(ax, ay) || 1;
+    g.fillStyle = ink(0, 0.85);
+    const sx = -u * 0.12, sy2 = sy + u * 0.05;
+    strokePoly(g, [[sx, sy2], [sx + ax / l * u * 0.3 * k, sy2 + ay / l * u * 0.3 * k]], tt => u * (0.05 - 0.02 * tt));
+    g.beginPath(); g.arc(sx + ax / l * u * 0.32 * k, sy2 + ay / l * u * 0.32 * k, u * 0.025, 0, 6.28); g.fill();
+  }
+  g.restore();
+  g.restore();
+  return {hx:cx + (opt.face || 1) * u * 0.12, hy:y0 - u * 0.47 + bob};
+}
+function drawBrush(g, hx, hy, tx, ty, u){
+  let dx = tx - hx, dy = ty - hy; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+  const tuft = u * 0.24, sx = hx - dx * u * 0.25, sy = hy - dy * u * 0.25, ex = tx - dx * tuft, ey = ty - dy * tuft;
+  g.fillStyle = ink(2, 0.85);
+  strokePoly(g, [[sx, sy], [(sx + ex) / 2, (sy + ey) / 2], [ex, ey]], tt => u * (0.05 + 0.012 * tt));
+  g.fillStyle = ink(0, 0.6);
+  for (let k = 1; k < 4; k++){ const q = k / 4; g.beginPath(); g.ellipse(lerp(sx, ex, q), lerp(sy, ey, q), u * 0.032, u * 0.01, Math.atan2(dy, dx) + Math.PI / 2, 0, 6.28); g.fill(); }
+  // 穂
+  const nx = -dy, ny = dx;
+  g.fillStyle = ink(0, 0.95); g.beginPath();
+  g.moveTo(ex + nx * u * 0.045, ey + ny * u * 0.045);
+  g.quadraticCurveTo(ex + dx * tuft * 0.55 + nx * u * 0.06, ey + dy * tuft * 0.55 + ny * u * 0.06, tx, ty);
+  g.quadraticCurveTo(ex + dx * tuft * 0.55 - nx * u * 0.06, ey + dy * tuft * 0.55 - ny * u * 0.06, ex - nx * u * 0.045, ey - ny * u * 0.045);
+  g.closePath(); g.fill();
+}
+function drawDrum(g, name, hl){
+  const d = LY[name], D = G.drums[name], t = G.t, R = d.R;
+  let cy = d.y, sq = 0;
+  const pt = t - D.pressT; if (pt >= 0 && pt < 0.7) sq = Math.exp(-pt * 8) * Math.cos(pt * 28);
+  let bob = 0; if (hl){ const ph = (t * 1.6) % 1; bob = -Math.max(0, Math.sin(ph * Math.PI * 2)) * R * 0.07 * (ph < 0.5 ? 1 : 0); }
+  cy += bob;
+  const ry = R * 0.36;
+  const bodyH = R * 0.82 * (1 + 0.06 * sq);
+  // 影
+  g.fillStyle = ink(3, 0.22); g.beginPath(); g.ellipse(d.x, d.y + bodyH + R * 0.16, R * 1.05, R * 0.14, 0, 0, 6.28); g.fill();
+  // 脚
+  g.fillStyle = ink(1, 0.8);
+  strokePoly(g, [[d.x - R * 0.55, cy + bodyH * 0.7], [d.x - R * 0.78, d.y + bodyH + R * 0.15]], tt => R * (0.07 - 0.03 * tt));
+  strokePoly(g, [[d.x + R * 0.55, cy + bodyH * 0.7], [d.x + R * 0.78, d.y + bodyH + R * 0.15]], tt => R * (0.07 - 0.03 * tt));
+  // 胴
+  const gr = g.createLinearGradient(d.x - R, 0, d.x + R, 0);
+  gr.addColorStop(0, ink(0, 0.92)); gr.addColorStop(0.35, ink(1, 0.78)); gr.addColorStop(0.6, ink(2, 0.7)); gr.addColorStop(1, ink(0, 0.92));
+  g.fillStyle = gr; g.beginPath();
+  g.moveTo(d.x - R, cy); g.bezierCurveTo(d.x - R * 1.1, cy + bodyH * 0.4, d.x - R * 1.06, cy + bodyH * 0.8, d.x - R * 0.92, cy + bodyH);
+  g.ellipse(d.x, cy + bodyH, R * 0.92, ry * 0.9, 0, Math.PI, 0, true);
+  g.bezierCurveTo(d.x + R * 1.06, cy + bodyH * 0.8, d.x + R * 1.1, cy + bodyH * 0.4, d.x + R, cy);
+  g.closePath(); g.fill();
+  const r = mulberry(name === 'big' ? 5 : 9);
+  kasure(g, [[d.x - R * 0.9, cy + bodyH * 0.45], [d.x, cy + bodyH * 0.5], [d.x + R * 0.9, cy + bodyH * 0.45]], () => bodyH * 0.6, r, 5, 0.25);
+  // 鋲
+  g.fillStyle = 'rgba(215,205,182,0.9)';
+  for (let k = 0; k < 11; k++){ const a = Math.PI * (0.06 + 0.88 * k / 10); g.beginPath(); g.arc(d.x - Math.cos(a) * R * 0.97, cy + Math.sin(a) * ry * 0.95 + R * 0.08, R * 0.028, 0, 6.28); g.fill(); }
+  // 皮（押しつぶし・伸び・はね返り）
+  const sry = ry * (1 - 0.3 * sq), srx = R * (1 + 0.04 * sq), scy = cy + R * 0.06 * sq;
+  g.fillStyle = 'rgb(232,222,198)'; g.beginPath(); g.ellipse(d.x, scy, srx, sry, 0, 0, 6.28); g.fill();
+  const sg = g.createRadialGradient(d.x, scy, 0, d.x, scy, srx);
+  sg.addColorStop(0, ink(4, 0.05 + 0.25 * Math.max(0, sq))); sg.addColorStop(1, ink(3, 0.25));
+  g.fillStyle = sg; g.beginPath(); g.ellipse(d.x, scy, srx, sry, 0, 0, 6.28); g.fill();
+  // 縁の筆
+  const rim = [];
+  for (let k = 0; k <= 28; k++){ const a = k / 28 * Math.PI * 2 + 0.3; rim.push([d.x + Math.cos(a) * srx, scy + Math.sin(a) * sry]); }
+  g.fillStyle = ink(0, 0.9); strokePoly(g, rim, tt => R * (0.03 + 0.03 * Math.abs(Math.sin(tt * Math.PI * 2 + 1))));
+  // 誘いの光（ひとつだけ）
+  if (hl){
+    const a = 0.18 + 0.12 * Math.sin(t * 4);
+    g.strokeStyle = 'rgba(255,250,236,' + (a + 0.25) + ')'; g.lineWidth = R * 0.08; g.beginPath(); g.ellipse(d.x, scy, srx * 1.16, sry * 1.3, 0, 0, 6.28); g.stroke();
+    g.strokeStyle = ink(3, a); g.lineWidth = R * 0.03; g.beginPath(); g.ellipse(d.x, scy, srx * 1.24, sry * 1.42, 0, 0, 6.28); g.stroke();
+  }
+  // 拍の輪（薄墨）
+  if (G.beatT0 !== null && t - G.lastHit < 3 && (G.phase === 'paint' || G.phase === 'move')){
+    const T = songCfg().T; const ph = (t - G.beatT0) / T; const u = 1 - (ph - Math.floor(ph));
+    const sc = 1 + 0.55 * u, al = 0.12 + 0.45 * (1 - u);
+    g.strokeStyle = ink(2, al); g.lineWidth = R * (0.025 + 0.03 * (1 - u));
+    g.beginPath(); g.ellipse(d.x, scy, srx * sc * 1.04, sry * sc * 1.08, 0, 0, 6.28); g.stroke();
+    g.strokeStyle = ink(3, al * 0.6); g.lineWidth = R * 0.012;
+    g.beginPath(); g.ellipse(d.x + R * 0.01, scy + R * 0.01, srx * sc * 1.09, sry * sc * 1.15, 0, 0.3, 5.6); g.stroke();
+  }
+  // 輪が弾ける
+  for (const b of G.bursts){
+    if (b.name !== name) continue; const a = (t - b.t0) / 0.45; if (a < 0 || a > 1) continue;
+    g.strokeStyle = ink(b.dense ? 0 : 3, (1 - a) * (b.dense ? 0.55 : 0.4)); g.lineWidth = R * (b.dense ? 0.05 : 0.09) * (1 - a * 0.6);
+    g.beginPath(); g.ellipse(d.x, scy, srx * (1.05 + a * 0.7), sry * (1.1 + a * 0.8), 0, 0, 6.28); g.stroke();
+  }
+  // 朱の合図（同時に一か所だけ）
+  if (G.signal && G.signal.drum === name){
+    const p = 1 + 0.12 * Math.sin((t - G.signal.t0) * 4);
+    g.fillStyle = SHU + '0.9)'; g.beginPath(); g.ellipse(d.x, scy, R * 0.15 * p, R * 0.07 * p, 0, 0, 6.28); g.fill();
+    g.strokeStyle = SHU + '0.55)'; g.lineWidth = R * 0.035; g.beginPath(); g.ellipse(d.x, scy, srx * 1.3 * p, sry * 1.45 * p, 0, 0.2, 6.0); g.stroke();
+  }
+}
+function drawHand(g, x, y, s, al){
+  g.save(); g.globalAlpha = al; g.translate(x, y); g.rotate(-0.35);
+  g.fillStyle = 'rgba(247,241,229,0.96)'; g.strokeStyle = ink(1, 0.85); g.lineWidth = Math.max(1.5, s * 0.03);
+  g.beginPath(); g.moveTo(-s * 0.08, s * 0.05); g.lineTo(-s * 0.08, s * 0.55); g.quadraticCurveTo(-s * 0.3, s * 0.55, -s * 0.3, s * 0.8); g.quadraticCurveTo(-s * 0.25, s * 1.2, s * 0.1, s * 1.2);
+  g.quadraticCurveTo(s * 0.4, s * 1.15, s * 0.38, s * 0.7); g.quadraticCurveTo(s * 0.36, s * 0.5, s * 0.08, s * 0.5); g.lineTo(s * 0.08, s * 0.05); g.quadraticCurveTo(0, -s * 0.06, -s * 0.08, s * 0.05); g.closePath();
+  g.fill(); g.stroke();
+  g.beginPath(); g.moveTo(s * 0.08, s * 0.66); g.quadraticCurveTo(s * 0.22, s * 0.62, s * 0.3, s * 0.68); g.moveTo(s * 0.06, s * 0.82); g.quadraticCurveTo(s * 0.2, s * 0.78, s * 0.32, s * 0.85); g.stroke();
+  g.restore();
+}
+let lastReal = performance.now() / 1000;
+function draw(){
+  const t = G.t, S = G.sheet;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.drawImage(bgCv, 0, 0, bgCv.width, bgCv.height, 0, 0, W, H);
+  const hl = highlightTarget();
+  if (G.phase !== 'gallery'){
+    const R = sheetRect(), M = sceneMap(R);
+    // 巻物
+    ctx.fillStyle = ink(3, 0.18); ctx.fillRect(R.x + 4, R.y + 6, R.w, R.h);
+    { const pw = Math.min(sheetCv.width, Math.max(1, Math.round(R.w * DPR))); ctx.drawImage(sheetCv, 0, 0, pw, sheetCv.height, R.x, R.y, R.w, R.h); }
+    // 絵の層（変化した時だけ描き直す）
+    if (G.dirty || Math.abs(G.paintW - R.w) > 0.5){
+      paintG.setTransform(1, 0, 0, 1, 0, 0); paintG.clearRect(0, 0, paintCv.width, paintCv.height);
+      paintG.setTransform(DPR, 0, 0, DPR, 0, 0);
+      renderSheet(paintG, S, G.hDisp, {x:0, y:0, w:R.w, h:R.h}, {t, sealT0:G.sealT0});
+      G.dirty = false; G.paintW = R.w;
+    }
+    const sw = Math.min(paintCv.width, Math.ceil(R.w * DPR)), shh = Math.min(paintCv.height, Math.ceil(R.h * DPR));
+    if (sw > 1) ctx.drawImage(paintCv, 0, 0, sw, shh, R.x, R.y, sw / DPR, shh / DPR);
+    // 軸
+    for (const ax of [R.x, R.x + R.w]){
+      ctx.fillStyle = ink(1, 0.9); ctx.fillRect(ax - M.U * 0.018, R.y - M.U * 0.025, M.U * 0.036, R.h + M.U * 0.05);
+      ctx.fillStyle = ink(0, 0.95); ctx.beginPath(); ctx.ellipse(ax, R.y - M.U * 0.03, M.U * 0.026, M.U * 0.014, 0, 0, 6.28); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(ax, R.y + R.h + M.U * 0.03, M.U * 0.026, M.U * 0.014, 0, 0, 6.28); ctx.fill();
+      ctx.fillStyle = 'rgba(240,232,214,0.25)'; ctx.fillRect(ax - M.U * 0.008, R.y - M.U * 0.02, M.U * 0.005, R.h + M.U * 0.04);
+    }
+    if (G.phase === 'rollup' || G.phase === 'open'){ /* 巻いている途中は人物を出さない */ }
+    else {
+      ctx.save();
+      // 墨の落ち先
+      if (G.phase === 'paint'){
+        const px = M.X(G.cursor), py = M.Y(hAt(G.hDisp, G.cursor)) - M.U * 0.012, pr = M.U * (0.018 + 0.004 * Math.sin(t * 3));
+        ctx.strokeStyle = ink(3, 0.4); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.ellipse(px, py, pr, pr * 0.6, 0, 0.4, 5.9); ctx.stroke();
+        ctx.fillStyle = ink(4, 0.25); ctx.beginPath(); ctx.ellipse(px, py, pr * 0.6, pr * 0.35, 0, 0, 6.28); ctx.fill();
+      }
+      // 動く絵
+      if (G.phase === 'move' || G.phase === 'finish') drawMoving(ctx, M);
+      // 子
+      const ch = M.U * 0.2;
+      if (!G.walker){
+        const cp = childPos(M);
+        const tip = brushTip(M);
+        let look = {x:0, y:1}, pointTo = null;
+        const tgt = hl === 'big' || hl === 'small' ? LY[hl] : null;
+        if (tip && tip.active) look = {x:Math.sign(tip.x - cp.x) * 0.8, y:-0.8};
+        else if (G.boat) look = {x:Math.sign(M.X(G.boat.x) - cp.x), y:-0.3};
+        else if (tgt) look = {x:clamp((tgt.x - cp.x) / 200, -1, 1), y:1};
+        if (tgt) pointTo = {x:tgt.x - cp.x, y:tgt.y - cp.y};
+        if (t - G.child.hopT < 1.5 && G.phase === 'paint') pointTo = {x:M.X(G.cursor) + M.U * 0.4 - cp.x, y:-M.U * 0.2};
+        const hand = drawChild(ctx, M, cp.x, cp.y, ch, {look, pointTo, face:1});
+        if (tip) drawBrush(ctx, hand.hx, hand.hy, tip.x, tip.y, ch);
+        else drawBrush(ctx, hand.hx, hand.hy, hand.hx + ch * 0.25, hand.hy - ch * 1.1, ch * 0.8);
+      }
+      ctx.restore();
+    }
+  } else {
+    drawGallery(ctx);
+  }
+  // 粒子
+  for (const p of G.parts){ const a = 1 - (t - p.t0) / p.life; ctx.fillStyle = ink(p.tone, 0.8 * a); ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.28); ctx.fill(); }
+  // 太鼓
+  drawDrum(ctx, 'big', hl === 'big');
+  drawDrum(ctx, 'small', hl === 'small');
+  // お手本の手
+  if (G.demo){
+    const p = (t - G.demo.t0) / 1.9; let tx, ty, s;
+    if (G.demo.target === 'slot'){ const sl = gallerySlots(); const q = sl[Math.max(0, G.gallery.length - 1)]; tx = q.x + q.w / 2; ty = q.y + q.h / 2; s = Math.min(q.h * 0.5, 90); }
+    else { const d = LY[G.demo.target]; tx = d.x; ty = d.y; s = d.R * 0.9; }
+    const sx = tx + s * 1.1, sy = ty + s * 1.4;
+    let x, y, al = 1;
+    if (p < 0.35){ const e = easeInOut(p / 0.35); x = lerp(sx, tx, e); y = lerp(sy, ty - s * 0.15, e); al = e; }
+    else if (p < 0.5){ const e = (p - 0.35) / 0.15; x = tx; y = ty - s * 0.15 + s * 0.15 * Math.sin(e * Math.PI); }
+    else if (p < 0.75){ x = tx; y = ty - s * 0.15; }
+    else { const e = (p - 0.75) / 0.25; x = lerp(tx, sx, e); y = lerp(ty - s * 0.15, sy, e); al = 1 - e; }
+    drawHand(ctx, x, y, s, al);
+  }
+}
+function drawMoving(g, M){
+  const t = G.t, U = M.U;
+  // こだま
+  for (const e of G.echoes){
+    const a = (t - e.t0) / 1.2; if (a < 0 || a > 1) continue;
+    const px = M.X(e.x), py = M.Y(hAt(G.hDisp, e.x));
+    for (let k = 0; k < 3; k++){ const rr = U * (0.03 + a * 0.22 + k * 0.035); g.strokeStyle = ink(2, (1 - a) * 0.5); g.lineWidth = Math.max(1, U * 0.006 * (1 - a)); g.beginPath(); g.arc(px, py, rr, Math.PI * 1.1, Math.PI * 1.9); g.stroke(); }
+  }
+  if (G.boat){
+    const B = G.boat, base = M.base;
+    for (const w of G.waves){
+      const px = M.X(w.x), big = w.kind === 'b', s = U * (big ? 0.035 : 0.018) * w.amp, al = clamp(1 - (t - w.t0) / 5, 0, 1) * (w.hit ? 0.4 : 0.8);
+      g.strokeStyle = ink(big ? 1 : 2, al); g.lineWidth = Math.max(1, U * (big ? 0.007 : 0.004));
+      for (let k = 0; k < (big ? 3 : 2); k++){ const ox = px - w.dir * k * s * 1.3, oy = base + U * 0.012 + k * U * 0.008; g.beginPath(); g.moveTo(ox - s, oy); g.quadraticCurveTo(ox - s * 0.2, oy - s * 0.9, ox + s * 0.3 * w.dir, oy - s * 0.2); g.stroke(); }
+    }
+    let hop = 0; const ht = t - B.hopT; if (ht < 0.5) hop = Math.sin(ht / 0.5 * Math.PI) * U * 0.025;
+    const bx = M.X(B.x), by = base + U * 0.014 - hop + Math.sin(t * 2.2) * U * 0.002;
+    const s = U * 0.085;
+    g.save(); g.translate(bx, by); g.scale(B.dir, 1); g.rotate(ht < 0.5 ? -Math.sin(ht / 0.5 * Math.PI * 2) * 0.15 : 0);
+    g.fillStyle = ink(0, 0.9);
+    g.beginPath(); g.moveTo(-s, -s * 0.12); g.quadraticCurveTo(0, s * 0.32, s * 1.05, -s * 0.22); g.quadraticCurveTo(0, s * 0.1, -s, -s * 0.12); g.fill();
+    strokePoly(g, [[s * 0.15, -s * 0.05], [s * 0.05, -s * 0.85]], tt => s * (0.05 - 0.03 * tt));
+    g.fillStyle = ink(2, 0.55); g.beginPath(); g.moveTo(s * 0.08, -s * 0.8); g.quadraticCurveTo(s * 0.5, -s * 0.5, s * 0.12, -s * 0.15); g.closePath(); g.fill();
+    g.restore();
+    g.strokeStyle = ink(2, 0.35); g.lineWidth = 1; g.beginPath(); g.moveTo(bx - s * 0.8, base + U * 0.032); g.lineTo(bx + s * 0.8, base + U * 0.032); g.stroke();
+  }
+  if (G.walker){
+    const Wk = G.walker, px = M.X(Wk.x);
+    const onPath = G.sheet.paths.some(p => Wk.x >= p.x0 && Wk.x <= p.x1);
+    const hh = hAt(G.hDisp, Wk.x) * (onPath ? 0.5 : 1) + (onPath ? 0.008 : 0);
+    let hop = 0; const ht = t - Wk.hopT; if (ht < 0.45) hop = Math.sin(ht / 0.45 * Math.PI) * U * 0.05;
+    const ch = U * 0.12, cp = {x:px, y:M.Y(hh) + U * 0.004};
+    const hand = drawChild(g, M, cp.x, cp.y, ch, {look:{x:1, y:0}, face:1, walk:true, hop});
+    drawBrush(g, hand.hx, hand.hy, hand.hx - ch * 0.5, hand.hy - ch * 0.9, ch * 0.8);
+  }
+}
+function drawGallery(g){
+  const t = G.t, slots = gallerySlots();
+  const newest = G.gallery.length - 1;
+  for (const sl of slots){
+    let bob = 0;
+    if (sl.idx === newest && sl.idx >= 0){ const ph = (t * 1.6) % 1; bob = -Math.max(0, Math.sin(ph * Math.PI * 2)) * 6 * (ph < 0.5 ? 1 : 0); }
+    const x = sl.x, y = sl.y + bob, w = sl.w, h = sl.h;
+    g.fillStyle = ink(3, 0.18); g.fillRect(x + 3, y + 5, w, h);
+    if (sl.idx >= 0){ g.drawImage(miniCanvas(G.gallery[sl.idx], w, h), x, y, w, h); }
+    else { g.fillStyle = pat(g, 'sheet'); g.fillRect(x, y, w, h); renderSheet(g, BLANK, BLANK.h, {x, y, w, h}, {mini:true}); }
+    for (const ax of [x, x + w]){ g.fillStyle = ink(1, 0.9); g.fillRect(ax - 3, y - 4, 6, h + 8); }
+    if (sl.idx === newest && sl.idx >= 0){
+      const a = 0.25 + 0.15 * Math.sin(t * 4);
+      g.strokeStyle = 'rgba(255,250,236,' + (a + 0.3) + ')'; g.lineWidth = 6; g.strokeRect(x - 9, y - 9, w + 18, h + 18);
+      g.strokeStyle = ink(3, a); g.lineWidth = 2; g.strokeRect(x - 13, y - 13, w + 26, h + 26);
+    }
+  }
+  // 子は新しい巻物を指す
+  const s = LY.sheet, ch = s.h * 0.18;
+  const tgt = slots[Math.max(0, newest)], cx = s.left + s.fullW * (LY.port ? 0.5 : 0.5), cy = s.y + s.h + ch * 0.05;
+  if (LY.port || true){
+    const hand = drawChild(g, null, Math.min(s.right - ch * 0.4, cx), cy, ch, {look:{x:Math.sign(tgt.x + tgt.w / 2 - cx), y:-1}, pointTo:{x:tgt.x + tgt.w / 2 - cx, y:tgt.y + tgt.h / 2 - cy}, face:1});
+    drawBrush(g, hand.hx, hand.hy, hand.hx + ch * 0.25, hand.hy - ch * 0.9, ch * 0.7);
+  }
+}
+const BLANK = newSheet();
+
+// ---------------- ループ ----------------
+let raf = 0, running = false;
+function frame(ts){
+  raf = requestAnimationFrame(frame);
+  const real = ts / 1000; let dt = real - lastReal; lastReal = real;
+  if (!(dt > 0)) dt = 0; if (dt > 0.05) dt = 0.05;
+  G.t += dt;
+  update(dt); draw();
+}
+function start(){ if (running) return; running = true; lastReal = performance.now() / 1000; raf = requestAnimationFrame(frame); }
+function stop(){ running = false; cancelAnimationFrame(raf); }
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden){ stop(); try { if (AC && AC.state === 'running') AC.suspend(); } catch (e) {} }
+  else { try { if (AC && AC.state === 'suspended') AC.resume(); } catch (e) {} start(); }
+});
+window.addEventListener('pagehide', () => stop());
+window.addEventListener('pageshow', () => { if (!document.hidden) start(); });
+let rzT = 0;
+function onResize(){ clearTimeout(rzT); rzT = setTimeout(() => { layout(); }, 60); }
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', onResize);
+
+startSong(newSheet());
+layout();
+G.lastInput = 0;
+start();
+
+// 自動テスト用の読み取り口（画面には何も出さない）
+window.__sumi = {
+  G, LY,
+  drum(name){ const d = LY[name]; return {x:d.x, y:d.y + d.R * 0.1}; },
+  slots(){ return gallerySlots(); },
+  lakes(){ return lakeSpans(G.sheet); },
+  bench(n){ const a = performance.now(); for (let i = 0; i < (n || 10); i++){ draw(); } const b = performance.now(); for (let i = 0; i < (n || 10); i++){ G.dirty = true; draw(); } return {draw:(b - a) / (n || 10), drawDirty:(performance.now() - b) / (n || 10)}; },
+  beatInfo(){ return {T:songCfg().T, t0:G.beatT0, now:now()}; }
+};
+})();
+</script>
+</body>
+</html>
